@@ -1,0 +1,98 @@
+[build-system]
+requires = ["setuptools>=75.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cart-recovery"
+version = "0.1.0"
+description = "Sandbox backend for a voice cart-recovery agent (phase 0 skeleton)."
+readme = "DECISIONS.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.115.12",
+    "uvicorn[standard]==0.34.2",
+    "pydantic==2.10.6",
+    "pydantic-settings==2.8.1",
+    "sqlalchemy[asyncio]==2.0.40",
+    "asyncpg==0.30.0",
+    "alembic==1.15.1",
+    "redis==5.2.1",
+    "greenlet==3.1.1",
+    "websockets==17.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.5",
+    "pytest-asyncio==0.25.3",
+    "httpx==0.28.1",
+    "ruff==0.11.2",
+    "mypy==1.15.0",
+    "pip-tools==7.4.1",
+]
+
+[tool.setuptools.packages.find]
+include = [
+    "app*",
+    "store*",
+    "orchestrator*",
+    "agent*",
+    "voice*",
+    "telemetry*",
+    "handoff*",
+]
+
+[tool.pip-tools]
+generate-hashes = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+src = [
+    "app",
+    "store",
+    "orchestrator",
+    "agent",
+    "voice",
+    "telemetry",
+    "handoff",
+    "tests",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "ASYNC"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/conftest.py" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "app",
+    "store",
+    "orchestrator",
+    "agent",
+    "voice",
+    "telemetry",
+    "handoff",
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+packages = [
+    "app",
+    "store",
+    "orchestrator",
+    "agent",
+    "voice",
+    "telemetry",
+    "handoff",
+]
+mypy_path = "."

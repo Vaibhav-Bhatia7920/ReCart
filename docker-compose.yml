@@ -1,0 +1,68 @@
+services:
+  app:
+    build: .
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8000
+      POSTGRES_USER: ${POSTGRES_USER:-cart}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cart}
+      POSTGRES_DB: ${POSTGRES_DB:-cart_recovery}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-cart}:${POSTGRES_PASSWORD:-cart}@postgres:5432/${POSTGRES_DB:-cart_recovery}
+      REDIS_URL: redis://redis:6379/0
+      CART_ABANDONMENT_TIMEOUT_SECONDS: ${CART_ABANDONMENT_TIMEOUT_SECONDS:-1800}
+      CART_ABANDONMENT_SWEEP_INTERVAL_SECONDS: ${CART_ABANDONMENT_SWEEP_INTERVAL_SECONDS:-10}
+      CART_ABANDONMENT_SWEEPER_ENABLED: ${CART_ABANDONMENT_SWEEPER_ENABLED:-true}
+      REDIS_ABANDONMENT_STREAM: ${REDIS_ABANDONMENT_STREAM:-store:cart-abandoned}
+      STORE_DELIVERY_FEE: ${STORE_DELIVERY_FEE:-4.99}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cart}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cart}
+      POSTGRES_DB: ${POSTGRES_DB:-cart_recovery}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
