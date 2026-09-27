@@ -12,6 +12,8 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from voice.errors import ASRConnectionDropped, ASRProviderError, ASRTimeoutError
 from voice.template import ASRBytes, FullTranscript, PartialTranscript
+from telemetry.instrument import TelemetryInstrument
+from telemetry.helper_functions import mark_event_in_db
 
 PROVIDER: Final = "deepgram"
 _LISTEN_URL: Final = "wss://api.deepgram.com/v1/listen"
@@ -68,21 +70,52 @@ class DeepgramASR:
         state = _SendState()
         seen_partial = False
 
+        if not hasattr(audio_chunks, "__aiter__"):
+            raise TypeError(
+                "transcribe_audio expects AsyncIterator[ASRBytes], not "
+                f"{type(audio_chunks).__name__}. Passing a WAV file as bytes "
+                "sends CloseStream with no audio; Deepgram then returns only "
+                "Metadata with an empty sha256."
+            )
+
         async def read_audio() -> None:
             try:
                 async for chunk in audio_chunks:
-                    await outgoing.put(chunk.bytes)
+                    payload = chunk.bytes if isinstance(chunk, ASRBytes) else chunk
+                    if not isinstance(payload, bytes | bytearray):
+                        raise TypeError(
+                            "audio chunks must be ASRBytes (or bytes), "
+                            f"got {type(chunk).__name__}"
+                        )
+                    await outgoing.put(bytes(payload))
             finally:
                 await outgoing.put(None)
 
         reader = asyncio.create_task(read_audio())
         reconnects_left = 1
+        print("--------------------------------")
+        print("Starting transcription")
+        print("--------------------------------")
         try:
             while True:
+                print("--------------------------------")
+                print("Reader: ", reader)
+                print("--------------------------------")
                 _raise_if_reader_failed(reader)
                 try:
-                    async for transcript in self._session(outgoing, state, call_id, turn_id, seen_partial):
+                    print("--------------------------------")
+                    print("Starting session")
+                    print("--------------------------------")
+                    async for transcript in self._session(
+                        outgoing, state, call_id, turn_id, seen_partial, reader
+                    ):
+                        print("--------------------------------")
+                        print("Transcript: ", transcript)
+                        print("--------------------------------")
                         if isinstance(transcript, PartialTranscript):
+                            print("--------------------------------")
+                            print("Seen partial: ", seen_partial)
+                            print("--------------------------------")
                             seen_partial = True
                         yield transcript
                     return
@@ -105,6 +138,7 @@ class DeepgramASR:
         call_id: str,
         turn_id: str,
         seen_partial: bool,
+        reader: asyncio.Task[None],
     ) -> AsyncIterator[PartialTranscript | FullTranscript]:
         query = urlencode(
             {
@@ -125,14 +159,28 @@ class DeepgramASR:
             ) as websocket:
                 pump = asyncio.create_task(_send_audio(websocket, outgoing, state))
                 try:
+                    print("--------------------------------")
+                    print("Starting to receive transcripts")
+                    print("--------------------------------")
                     async for raw in websocket:
+                        _raise_if_reader_failed(reader)
+                        print("--------------------------------")
+                        print("Raw: ", raw)
+                        print("--------------------------------")
                         for transcript, is_final in _transcripts_from_message(raw, call_id, turn_id):
+                            print("--------------------------------")
+                            print("Transcript: ", transcript)
+                            print("--------------------------------")
+                            print("Is final: ", is_final)
+                            print("--------------------------------")
                             if is_final:
+                                await mark_event_in_db(transcript.audio, "Final Transcript")
                                 # TELEMETRY HOOK: mark "final" — Deepgram signals is_final=true
                                 yield transcript
                             else:
                                 if not seen_partial:
                                     seen_partial = True
+                                    await mark_event_in_db(transcript.audio, "First Partial Transcript")
                                     # TELEMETRY HOOK: mark "first_partial" — first interim result received
                                 yield transcript
                     pump_error = pump.exception() if pump.done() else None
@@ -193,7 +241,13 @@ def _transcripts_from_message(
     turn_id: str,
 ) -> list[tuple[PartialTranscript | FullTranscript, bool]]:
     message = _object_dict(raw)
+    print("--------------------------------")
+    print("Message: ", message)
+    print("--------------------------------")
     message_type = message.get("type")
+    print("--------------------------------")
+    print("Message type: ", message_type)
+    print("--------------------------------")
     if message_type == "Error":
         # The published Results schema does not document this type. If Deepgram
         # sends it, fail the stream instead of ignoring an error frame.

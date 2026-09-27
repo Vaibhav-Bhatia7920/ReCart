@@ -72,6 +72,52 @@ Interim vs final follows Deepgram `Results.is_final`, not `speech_final`. `is_fi
 
 Connect timeout is 10 seconds (`ASRTimeoutError`). A WebSocket drop before `{"type":"CloseStream"}` retries once after 0.5 seconds, then raises `ASRConnectionDropped`. A normal close after `CloseStream` ends the generator without that error. Already-sent audio is not replayed on reconnect.
 
+## Deepgram Aura-2 streaming TTS
+
+`voice.adapters.deepgram_tts.DeepgramTTS` implements `TTSProvider.synthesize_audio`. It uses `wss://api.deepgram.com/v1/speak` (not Flux `/v2/speak`). Auth is the same `Authorization: Token <DEEPGRAM_API_KEY>` header as ASR.
+
+Query params: `model=aura-2-asteria-en`, `encoding=linear16`, `sample_rate=24000`. The speak schema's default model is `aura-asteria-en` (Aura 1); Aura-2 is the current generation in that same schema, and `aura-2-asteria-en` is the Aura-2 voice of the default name. Output is raw 16-bit PCM at 24 kHz. The speak query schema has no `channels` field; Deepgram's playback examples treat this encoding as mono. This adapter does not resample. `call_id` and `turn_id` are accepted to match the Protocol and are not sent — the speak messages have no call fields.
+
+Text chunks are JSON text frames `{"type":"Speak","text":...}`. That `type` is `Speak` in the AsyncAPI spec and the generated Python SDK. One current Node sample on the websocket guide says `type: "Text"`; that does not match the spec, so this adapter does not send `Text`. When the text iterator ends, the client sends `{"type":"Close"}`, which the spec describes as flush-then-close after remaining audio. Binary frames are yielded as `bytes`. `Metadata`, `Flushed`, `Cleared`, and `Warning` (`description`, `code`) are not audio. `Warning` does not fail the stream.
+
+Connect timeout is 10 seconds (`TTSTimeoutError`). A drop before `Close` retries once after 0.5 seconds, then raises `TTSConnectionDropped`. Text already accepted by a dead socket is not replayed. A normal close after `Close` ends the generator.
+
 ## Sweeper is off in pytest
 
 `CART_ABANDONMENT_SWEEPER_ENABLED=false` in tests so the background task cannot race assertions. Tests call `sweep_abandoned_carts` directly (and the force-abandon endpoint) against a long timeout.
+
+# Decisions (agent call state)
+
+## Same database, two new tables
+
+`call_facts` and `turn_logs` (Alembic `0003`) extend the existing Postgres database. There is no second database. One call is one `call_facts` row. Each graph invocation reads that row plus the last two `turn_logs`, then inserts one `turn_logs` row and updates `call_facts` in the same transaction.
+
+## Telemetry is not copied onto turn_logs
+
+`turn_logs` has no latency, audio, or event columns. Telemetry stays on the telemetry path, which already keys events by `call_id` and `turn_id` (`voice.template` / `telemetry.helper_functions`). That pair is the join. The telemetry writer is still an in-process queue and has no table of its own yet; this revision does not invent one and does not duplicate those fields onto `turn_logs`, so each fact keeps a single writer.
+
+## `turn_logs.call_id` is ON DELETE RESTRICT
+
+The foreign key uses `ON DELETE RESTRICT`. Postgres refuses to delete a `call_facts` row while its turns exist, so the turn log stays unless it is removed first. `cleanup_test_call` deletes `turn_logs` for that `call_id` first, then the `call_facts` row.
+
+## One outcome column
+
+`call_facts.call_outcome` defaults to `in_progress` and is the only escalation column. Once the value is a terminal outcome, `commit_turn` rejects an update that would replace it with a different outcome.
+
+## Optimistic `current_turn_index`
+
+`commit_turn` writes `current_turn_index = expected_turn_index + 1` only in `UPDATE ... WHERE call_id = ? AND current_turn_index = expected_turn_index`. If that matches zero rows, or the `(call_id, turn_id)` insert collides, the transaction rolls back and raises `StaleTurnError`.
+
+# Decisions (agent graph)
+
+## TurnState is a Pydantic model
+
+`agent.state.TurnState` is a Pydantic model. LangGraph nodes return partial updates, and `run_turn` validates the graph output back into `TurnState`. `recent_turns` is capped at 2. `load_call_context` replaces `tool_calls_this_turn` with `[]` on every invocation.
+
+## clinical_question escalates on a graph edge
+
+`agent.intents.Intent` is the classifier's closed set. `OpenAIIntentClassifier` passes `IntentClassification` as the response schema, so the SDK parses the label into that model. `ALWAYS_ESCALATE` is `{clinical_question}`. `route_after_intent` sends that intent to `escalate` and every other known intent to `decide_action`.
+
+## websockets pin moved to 16.1.1
+
+`langgraph` 1.2.12 depends on `langgraph-sdk`, which requires `websockets<17`. The direct pin is now `websockets==16.1.1`. The Deepgram adapters call `connect(..., additional_headers=...)`, which 16.1.1 still accepts.

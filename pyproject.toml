@@ -18,7 +18,9 @@ dependencies = [
     "alembic==1.15.1",
     "redis==5.2.1",
     "greenlet==3.1.1",
-    "websockets==17.1",
+    "websockets==16.1.1",
+    "langgraph==1.2.12",
+    "openai==3.19.2",
 ]
 
 [project.optional-dependencies]
@@ -40,6 +42,7 @@ include = [
     "voice*",
     "telemetry*",
     "handoff*",
+    "state*",
 ]
 
 [tool.pip-tools]
@@ -62,6 +65,7 @@ src = [
     "voice",
     "telemetry",
     "handoff",
+    "state",
     "tests",
 ]
 
@@ -80,6 +84,7 @@ known-first-party = [
     "voice",
     "telemetry",
     "handoff",
+    "state",
 ]
 
 [tool.mypy]
@@ -94,5 +99,6 @@ packages = [
     "voice",
     "telemetry",
     "handoff",
+    "state",
 ]
 mypy_path = "."

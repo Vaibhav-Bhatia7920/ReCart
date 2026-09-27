@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     redis_abandonment_stream: str = "store:cart-abandoned"
     redis_abandonment_emitted_prefix: str = "store:abandonment"
     store_delivery_fee: Decimal = Decimal("4.99")
+    openai_api_key: str = ""
+    intent_model: str = "gpt-4o-mini"
 
 
 @lru_cache(maxsize=1)

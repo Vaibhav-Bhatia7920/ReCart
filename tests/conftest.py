@@ -96,8 +96,8 @@ async def _reset_store() -> None:
     async with engine.begin() as connection:
         await connection.execute(
             text(
-                "TRUNCATE cart_items, orders, addresses, carts, products, offers "
-                "RESTART IDENTITY CASCADE"
+                "TRUNCATE turn_logs, call_facts, cart_items, orders, addresses, carts, "
+                "products, offers RESTART IDENTITY CASCADE"
             )
         )
     await redis.delete(settings.redis_abandonment_stream)

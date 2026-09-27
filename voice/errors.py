@@ -65,6 +65,27 @@ class ASRConnectionDropped(ASRProviderError):
         super().__init__(message, provider)
 
 
+class TTSProviderError(ProviderError):
+    """Raised when a TTS provider fails. Subclasses distinguish timeout from a dropped socket."""
+
+    def __init__(self, message: str, provider: str = "tts"):
+        super().__init__(message, provider)
+
+
+class TTSTimeoutError(TTSProviderError):
+    """Raised when the TTS provider does not connect within the timeout."""
+
+    def __init__(self, message: str, provider: str = "tts"):
+        super().__init__(message, provider)
+
+
+class TTSConnectionDropped(TTSProviderError):
+    """Raised when the TTS socket drops and one reconnect does not restore the stream."""
+
+    def __init__(self, message: str, provider: str = "tts"):
+        super().__init__(message, provider)
+
+
 class DataCorruptionError(Exception):
     """
     DataCorruptionError is an exception that is raised when data corruption occurs.
