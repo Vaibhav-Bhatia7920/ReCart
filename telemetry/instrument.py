@@ -1,16 +1,19 @@
-import asyncio
 import time
-from typing import AsyncIterator
+from typing import Any
 
-from telemetry.helper_functions import context_manager, mark_event_in_db
-from voice.template import ASR_Bytes
+from telemetry.helper_functions import mark_event_in_db
+
+Event = str | dict[str, Any]
 
 
 class TelemetryInstrument:
-    def __init__(self, name: str, description: str, input_audio: AsyncIterator[ASR_Bytes]):
+    """Call-scoped telemetry handle. Voice and graph code mark events through this, not the DB writer."""
+
+    def __init__(self, name: str, description: str, call_id: str, turn_id: str) -> None:
         self.name = name
         self.description = description
-        self.input_audio = input_audio
+        self.call_id = call_id
+        self.turn_id = turn_id
 
     async def __aenter__(self) -> "TelemetryInstrument":
         self.start = time.time()
@@ -20,7 +23,5 @@ class TelemetryInstrument:
         self.end = time.time()
         self.duration = self.end - self.start
 
-    async def mark_event(self, event: str) -> None:
-        async for audio in context_manager(self.input_audio):
-            await mark_event_in_db(audio, event)
-            await asyncio.sleep(1)
+    async def mark_event(self, event: Event) -> None:
+        await mark_event_in_db(self.call_id, event, self.turn_id)

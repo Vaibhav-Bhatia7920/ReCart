@@ -10,9 +10,8 @@ from urllib.parse import urlencode
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
-from voice.errors import TTSConnectionDropped, TTSProviderError, TTSTimeoutError
 from telemetry.instrument import TelemetryInstrument
-from telemetry.helper_functions import mark_event_in_db
+from voice.errors import TTSConnectionDropped, TTSProviderError, TTSTimeoutError
 
 PROVIDER: Final = "deepgram"
 _SPEAK_URL: Final = "wss://api.deepgram.com/v1/speak"
@@ -63,11 +62,15 @@ class DeepgramTTS:
         call_id: str,
         turn_id: str,
     ) -> AsyncIterator[bytes]:
-        # Speak messages have no call_id / turn_id fields. Kept so the signature matches TTSProvider.
-        del call_id, turn_id
         outgoing: asyncio.Queue[str | None] = asyncio.Queue()
         state = _SendState()
         seen_audio = False
+        telemetry = TelemetryInstrument(
+            name="deepgram_tts",
+            description="Deepgram Aura-2 streaming TTS",
+            call_id=call_id,
+            turn_id=turn_id,
+        )
 
         async def read_text() -> None:
             try:
@@ -82,7 +85,7 @@ class DeepgramTTS:
             while True:
                 _raise_if_reader_failed(reader)
                 try:
-                    async for audio in self._session(outgoing, state, seen_audio):
+                    async for audio in self._session(outgoing, state, seen_audio, telemetry):
                         seen_audio = True
                         yield audio
                     return
@@ -103,6 +106,7 @@ class DeepgramTTS:
         outgoing: asyncio.Queue[str | None],
         state: _SendState,
         seen_audio: bool,
+        telemetry: TelemetryInstrument,
     ) -> AsyncIterator[bytes]:
         query = urlencode(
             {
@@ -125,13 +129,13 @@ class DeepgramTTS:
                                 continue
                             if not seen_audio:
                                 seen_audio = True
-                                await mark_event_in_db(raw, "First Audio Frame")
+                                await telemetry.mark_event("First Audio Frame")
                                 # TELEMETRY HOOK: mark "first_audio" — first TTS audio frame received
                             yield raw
                             continue
                         kind = _control_type(raw)
                         if kind == "Flushed":
-                            await mark_event_in_db(raw, "Flushed")
+                            await telemetry.mark_event("Flushed")
                             # TELEMETRY HOOK: mark "flushed" — Deepgram finished audio for text sent so far
                             continue
                     pump_error = pump.exception() if pump.done() else None

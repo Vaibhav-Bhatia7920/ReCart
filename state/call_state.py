@@ -84,6 +84,7 @@ async def start_call(
         confirmed_address=None,
         applied_offer_id=None,
         payment_link_sent=False,
+        turn_facts=[],
         call_outcome=CallOutcome.IN_PROGRESS,
         current_turn_index=0,
     )

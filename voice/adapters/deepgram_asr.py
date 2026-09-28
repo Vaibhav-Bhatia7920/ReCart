@@ -10,10 +10,9 @@ from urllib.parse import urlencode
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
+from telemetry.instrument import TelemetryInstrument
 from voice.errors import ASRConnectionDropped, ASRProviderError, ASRTimeoutError
 from voice.template import ASRBytes, FullTranscript, PartialTranscript
-from telemetry.instrument import TelemetryInstrument
-from telemetry.helper_functions import mark_event_in_db
 
 PROVIDER: Final = "deepgram"
 _LISTEN_URL: Final = "wss://api.deepgram.com/v1/listen"
@@ -69,6 +68,12 @@ class DeepgramASR:
         outgoing: asyncio.Queue[bytes | None] = asyncio.Queue()
         state = _SendState()
         seen_partial = False
+        telemetry = TelemetryInstrument(
+            name="deepgram_asr",
+            description="Deepgram Nova-3 streaming ASR",
+            call_id=call_id,
+            turn_id=turn_id,
+        )
 
         if not hasattr(audio_chunks, "__aiter__"):
             raise TypeError(
@@ -107,7 +112,7 @@ class DeepgramASR:
                     print("Starting session")
                     print("--------------------------------")
                     async for transcript in self._session(
-                        outgoing, state, call_id, turn_id, seen_partial, reader
+                        outgoing, state, call_id, turn_id, seen_partial, reader, telemetry
                     ):
                         print("--------------------------------")
                         print("Transcript: ", transcript)
@@ -139,6 +144,7 @@ class DeepgramASR:
         turn_id: str,
         seen_partial: bool,
         reader: asyncio.Task[None],
+        telemetry: TelemetryInstrument,
     ) -> AsyncIterator[PartialTranscript | FullTranscript]:
         query = urlencode(
             {
@@ -174,13 +180,13 @@ class DeepgramASR:
                             print("Is final: ", is_final)
                             print("--------------------------------")
                             if is_final:
-                                await mark_event_in_db(transcript.audio, "Final Transcript")
+                                await telemetry.mark_event("Final Transcript")
                                 # TELEMETRY HOOK: mark "final" — Deepgram signals is_final=true
                                 yield transcript
                             else:
                                 if not seen_partial:
                                     seen_partial = True
-                                    await mark_event_in_db(transcript.audio, "First Partial Transcript")
+                                    await telemetry.mark_event("First Partial Transcript")
                                     # TELEMETRY HOOK: mark "first_partial" — first interim result received
                                 yield transcript
                     pump_error = pump.exception() if pump.done() else None

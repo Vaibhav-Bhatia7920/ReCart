@@ -76,6 +76,7 @@ class CallFactsView(BaseModel):
     confirmed_address: ConfirmedAddress | None
     applied_offer_id: str | None
     payment_link_sent: bool
+    turn_facts: list[dict[str, Any]]
     call_outcome: CallOutcome
     current_turn_index: int
     created_at: datetime
@@ -102,6 +103,7 @@ class CallFactsUpdate(BaseModel):
     confirmed_address: ConfirmedAddress | None = None
     applied_offer_id: str | None = None
     payment_link_sent: bool | None = None
+    turn_facts: list[dict[str, Any]] | None = None
     call_outcome: CallOutcome | None = None
 
     def set_fields(self) -> dict[str, Any]:

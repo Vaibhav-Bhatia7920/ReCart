@@ -34,7 +34,7 @@ class TTSProvider(Protocol):
     def __init__(self):
         self.synthesizer = DeepgramTTS(DEEPGRAM_API_KEY)
 
-    def synthesize_audio(
+    async def synthesize_audio(
         self, text: AsyncIterator[str], call_id: str, turn_id: str
     ) -> AsyncIterator[bytes]:
         """

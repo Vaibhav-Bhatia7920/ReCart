@@ -46,6 +46,9 @@ class CallFacts(Base):
     confirmed_address: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
     applied_offer_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     payment_link_sent: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
+    turn_facts: Mapped[list[dict[str, object]]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
     call_outcome: Mapped[CallOutcome] = mapped_column(
         Enum(
             CallOutcome,
