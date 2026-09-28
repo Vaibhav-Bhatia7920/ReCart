@@ -10,8 +10,11 @@ from app.settings import get_settings
 _SYSTEM = (
     "Classify the caller's latest utterance as exactly one intent. "
     f"Allowed intents: {', '.join(intent.value for intent in Intent)}. "
-    "Use clinical_question for symptoms, dosing, side effects, interactions, "
-    "or whether a medicine is appropriate for the caller. "
+    "Use clinical_question only for symptoms, dosing, side effects, interactions, "
+    "or appropriateness questions about prescription, restricted, or otherwise "
+    "medicated drugs that a pharmacist must handle. "
+    "Do not use clinical_question for vitamins, supplements, or typical OTC products; "
+    "those stay on the agent path (usually other). "
     "The response schema is the only output."
 )
 

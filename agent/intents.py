@@ -6,8 +6,9 @@ from pydantic import BaseModel, ConfigDict
 class Intent(str, Enum):
     """Fixed labels the classifier may return.
 
-    clinical_question is the escalation boundary. Routing reads ALWAYS_ESCALATE;
-    the prompt does not decide whether to escalate.
+    clinical_question is the escalation boundary for prescription or restricted
+    medicines. Routing reads ALWAYS_ESCALATE; the prompt does not decide
+    whether to escalate. OTC and vitamin questions stay on the agent path.
     """
 
     ASK_DISCOUNT = "ask_discount"

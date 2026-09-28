@@ -1,4 +1,5 @@
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -26,6 +27,7 @@ class TurnState(BaseModel):
     recent_turns: list[TurnLogView] = Field(default_factory=list)
     tool_calls_this_turn: list[ToolCallRecord] = Field(default_factory=list)
     agent_response_text: str = ""
+    current_turn_facts: dict[str, Any] = Field(default_factory=dict)
     turn_outcome: TurnOutcome | None = None
 
     @field_validator("recent_turns")

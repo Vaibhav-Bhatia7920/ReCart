@@ -10,3 +10,11 @@ class IntentClassifierError(AgentError):
 
 class UnclassifiedIntentError(AgentError):
     pass
+
+
+class ActionPlannerError(AgentError):
+    pass
+
+
+class FinalResponseError(AgentError):
+    pass
