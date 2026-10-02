@@ -8,3 +8,11 @@ async def test_health(client: AsyncClient) -> None:
     assert body["status"] == "ok"
     assert body["database"] == "ok"
     assert body["redis"] == "ok"
+
+
+async def test_health_allows_localhost_cors_origin(client: AsyncClient) -> None:
+    origin = "http://localhost:8080"
+    response = await client.get("/health", headers={"Origin": origin})
+    assert response.status_code == 200
+    assert response.headers.get("access-control-allow-origin") == origin
+

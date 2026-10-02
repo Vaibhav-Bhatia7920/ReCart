@@ -16,6 +16,7 @@ services:
       CART_ABANDONMENT_SWEEPER_ENABLED: ${CART_ABANDONMENT_SWEEPER_ENABLED:-true}
       REDIS_ABANDONMENT_STREAM: ${REDIS_ABANDONMENT_STREAM:-store:cart-abandoned}
       STORE_DELIVERY_FEE: ${STORE_DELIVERY_FEE:-4.99}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080}
     depends_on:
       postgres:
         condition: service_healthy

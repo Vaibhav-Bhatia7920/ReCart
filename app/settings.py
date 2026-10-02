@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     store_delivery_fee: Decimal = Decimal("4.99")
     openai_api_key: str = ""
     intent_model: str = "gpt-4o-mini"
+    cors_origins: str = "http://localhost:8080,http://127.0.0.1:8080"
+
+    def cors_origin_list(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
 
 @lru_cache(maxsize=1)
