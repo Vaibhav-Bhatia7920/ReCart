@@ -9,6 +9,7 @@ from sqlalchemy import text
 
 from app.db import close_db, get_engine, get_redis, init_engine, init_redis
 from app.settings import get_settings
+from app.voice_ws import default_asr_factory, default_tts_factory, router as voice_ws_router
 from store.router import router as store_router
 from store.sweeper import run_abandonment_sweeper
 
@@ -18,6 +19,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     app.state.engine = init_engine(settings.database_url)
     app.state.redis = init_redis(settings.redis_url)
+    app.state.asr_factory = default_asr_factory
+    app.state.tts_factory = default_tts_factory
     stop = asyncio.Event()
     sweeper_task: asyncio.Task[None] | None = None
     if settings.cart_abandonment_sweeper_enabled:
@@ -40,6 +43,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(store_router)
+app.include_router(voice_ws_router)
 
 
 @app.get("/health")

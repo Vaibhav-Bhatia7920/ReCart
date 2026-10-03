@@ -28,6 +28,7 @@ async def test_mark_event_appends_under_call_id(client: Any) -> None:
         "First Audio Frame",
         "Flushed",
     ]
+   
     assert all(item["turn_id"] == "1" for item in row.events)
 
 
