@@ -6,12 +6,149 @@ import wave
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+import os
+import numpy as np
+import sounddevice as sd
+import queue as std_queue
 from voice.interfaces import ASRProvider, TTSProvider
 from voice.template import ASRBytes, FullTranscript, PartialTranscript
+from app.db import init_engine
 
 _PCM_RATE = 16000
 _CHUNK_BYTES = 3200  # 100 ms of 16 kHz 16-bit mono
+_SAMPLE_RATE = 16000
+_BLOCK_SIZE = 1024
+_CHANNELS = 1
+from dotenv import load_dotenv
 
+load_dotenv()
+
+async def mic_streamer(queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
+
+    def callback(indata, frames, time, status):
+        audio_chunk = indata.copy()
+        loop.call_soon_threadsafe(queue.put_nowait, audio_chunk)
+
+    stream = sd.InputStream(
+        samplerate=_SAMPLE_RATE,
+        blocksize=_BLOCK_SIZE,
+        channels=_CHANNELS,
+        callback=callback,
+        dtype='int16',
+    )
+    stream.start()
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        stream.stop()
+        stream.close()
+        return
+
+async def _mic_consume_chunk(queue: asyncio.Queue, call_id: str, turn_id: str):
+
+    while True:
+        try:
+            chunk = await queue.get()
+        except asyncio.QueueEmpty:
+            print("Queue is empty")
+            break
+        async for audio_chunk in _chunk_pcm(chunk.tobytes(), call_id=call_id, turn_id=turn_id):
+            yield audio_chunk
+        queue.task_done()
+    
+
+async def mic_consumer(queue: asyncio.Queue):
+    asr_provider = ASRProvider()
+    call_id = "123"
+    turn_id = "456"
+    audio_stream = _mic_consume_chunk(queue, call_id=call_id, turn_id=turn_id)
+    try:
+        while True:
+            async for transcript in asr_provider.transcribe_audio(audio_stream, call_id, turn_id):
+                print("mic consumer got transcript")
+                print(transcript)
+                yield transcript
+                
+        queue.task_done()
+
+    except asyncio.CancelledError:
+        return
+
+
+# async def _text_to_speech_consume_chunk(queue: asyncio.Queue, call_id: str, turn_id: str):
+#     while True:
+#         try:
+#             text = await mic_consumer(queue)
+#             print("text to speech consumer got text")
+#             print(text)
+#         except asyncio.QueueEmpty:
+#             print("Queue is empty")
+#             break
+       
+#             yield text
+#         queue.task_done()
+
+async def text_to_speech_consumer(queue: asyncio.Queue, transcript_stream: AsyncIterator[PartialTranscript | FullTranscript]):
+    tts_provider = TTSProvider()
+
+    call_id = "123"
+    turn_id = "456"
+    print("text to speech consumer started")
+    async def extract_text():
+        async for transcript in transcript_stream:
+            if isinstance(transcript, FullTranscript):
+                yield transcript.text
+            # Use .text or whatever attribute holds the string on your Transcript model
+            
+    try:
+        while True:
+            print("text to speech consumer waiting for transcript")
+            async for audio_chunk in tts_provider.synthesize_audio(extract_text(), call_id, turn_id):
+                print("synthesizing audio chunk")
+                print(len(audio_chunk))
+                queue.put_nowait(audio_chunk)
+        queue.task_done()
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        print(e)
+        return
+
+async def speech_streamer(speaker_queue: std_queue.Queue):
+
+    def callback(outdata, frames, time, status):
+        try:
+            # 1. Safely pull from the standard thread-safe queue
+            chunk = speaker_queue.get_nowait()
+            
+            # 2. Write bytes to outdata, safely handling size mismatches
+            length = min(len(chunk), len(outdata))
+            outdata[:length] = chunk[:length]
+            
+            # 3. Pad with silence if the chunk is smaller than the required frame size
+            if length < len(outdata):
+                outdata[length:] = b'\x00' * (len(outdata) - length)
+                
+        except std_queue.Empty:
+            # Play silence if the TTS hasn't provided audio yet
+            outdata[:] = b'\x00' * len(outdata)
+
+    speaker_stream = sd.RawOutputStream(
+        samplerate=_SAMPLE_RATE,
+        channels=_CHANNELS,
+        dtype='int16',
+        blocksize=0,
+        callback=callback,
+    )
+    speaker_stream.start()
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        speaker_stream.stop()
+        speaker_stream.close()
+        return
 
 def _wav_to_pcm16k_mono(wav_bytes: bytes) -> bytes:
     """Strip the WAV container and match DeepgramASR's linear16 / 16 kHz / mono socket."""
@@ -74,3 +211,30 @@ async def _chunk_pcm(pcm: bytes, *, call_id: str, turn_id: str) -> AsyncIterator
             call_id=call_id,
             turn_id=turn_id,
         )
+
+
+if __name__ == "__main__":
+    async def main():
+        init_engine(os.getenv("DATABASE_URL"))
+        loop = asyncio.get_event_loop()
+        mic_queue = asyncio.Queue()
+        speaker_queue = std_queue.Queue()
+        stream_task = asyncio.create_task(mic_streamer(mic_queue, loop))
+        print("stream task started")
+        transcript_stream = mic_consumer(mic_queue)
+        print("transcript stream started")
+        text_to_speech_task = asyncio.create_task(text_to_speech_consumer(speaker_queue, transcript_stream))
+        print("text to speech task started")
+        speech_streamer_task = asyncio.create_task(speech_streamer(speaker_queue))
+        try:
+            await asyncio.gather(stream_task, text_to_speech_task, speech_streamer_task)
+        except asyncio.CancelledError:
+            stream_task.cancel()
+            text_to_speech_task.cancel()
+            speech_streamer_task.cancel()   
+            await asyncio.gather(stream_task, text_to_speech_task, speech_streamer_task, return_exceptions=True)
+            loop.stop()
+            loop.close()
+        except Exception as e:
+            print(e)
+    asyncio.run(main())

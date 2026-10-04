@@ -15,6 +15,10 @@ _redis: Redis | None = None
 
 def init_engine(database_url: str) -> AsyncEngine:
     global _engine, _session_factory
+
+    if _engine is not None:
+        return _engine
+        
     _engine = create_async_engine(database_url)
     _session_factory = async_sessionmaker(
         _engine,

@@ -44,6 +44,9 @@ async def db_worker(queue: asyncio.Queue) -> None:
         future = None
         try:
             call_id, event, turn_id, future = await queue.get()
+        except asyncio.CancelledError:
+            break
+        try:
             await persist_call_event(call_id, event, turn_id)
             future.set_result(True)
         except Exception as e:
