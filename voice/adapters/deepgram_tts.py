@@ -113,6 +113,7 @@ class DeepgramTTS:
                 "model": _MODEL,
                 "encoding": _ENCODING,
                 "sample_rate": str(_SAMPLE_RATE),
+                "container": "none",
             }
         )
         try:

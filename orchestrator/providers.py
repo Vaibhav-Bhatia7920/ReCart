@@ -6,6 +6,7 @@ import wave
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+import io
 import os
 import numpy as np
 import sounddevice as sd
@@ -13,6 +14,7 @@ import queue as std_queue
 from voice.interfaces import ASRProvider, TTSProvider
 from voice.template import ASRBytes, FullTranscript, PartialTranscript
 from app.db import init_engine
+from agent.simple_agent_stateless_v1 import SimpleAgentStatelessV1
 
 _PCM_RATE = 16000
 _CHUNK_BYTES = 3200  # 100 ms of 16 kHz 16-bit mono
@@ -24,7 +26,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 async def mic_streamer(queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
-
+    print("mic streamer started")
     def callback(indata, frames, time, status):
         audio_chunk = indata.copy()
         loop.call_soon_threadsafe(queue.put_nowait, audio_chunk)
@@ -46,14 +48,19 @@ async def mic_streamer(queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
         return
 
 async def _mic_consume_chunk(queue: asyncio.Queue, call_id: str, turn_id: str):
-
+    print("mic consumer started")
     while True:
         try:
             chunk = await queue.get()
+            print("mic consumer got chunk")
+            
         except asyncio.QueueEmpty:
             print("Queue is empty")
+            print("mic consumer got queue empty")
             break
         async for audio_chunk in _chunk_pcm(chunk.tobytes(), call_id=call_id, turn_id=turn_id):
+            print("mic consumer got audio chunk")
+            
             yield audio_chunk
         queue.task_done()
     
@@ -63,18 +70,40 @@ async def mic_consumer(queue: asyncio.Queue):
     call_id = "123"
     turn_id = "456"
     audio_stream = _mic_consume_chunk(queue, call_id=call_id, turn_id=turn_id)
-    try:
-        while True:
-            async for transcript in asr_provider.transcribe_audio(audio_stream, call_id, turn_id):
-                print("mic consumer got transcript")
-                print(transcript)
-                yield transcript
-                
-        queue.task_done()
+    print("mic consumer audio stream started")
+    try:  
+        async for transcript in asr_provider.transcribe_audio(audio_stream, call_id, turn_id):
+            print("mic consumer got transcript")
+            print(transcript)
+            yield transcript
+            
+        # queue.task_done()
 
     except asyncio.CancelledError:
         return
 
+async def agent_flow(transcript_stream: AsyncIterator[PartialTranscript | FullTranscript]):
+    try:
+        agent = SimpleAgentStatelessV1()
+    except Exception as e:
+        print(e)
+        return
+    try:
+        print("agent flow started")
+        async for transcript in transcript_stream:
+            print("agent flow got transcript")
+            if isinstance(transcript, FullTranscript):
+                response = await agent.run(transcript.text)
+                transcript.text = response
+                print("agent flow got response")
+                print(response)
+                yield transcript
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        print(e)
+        return
+        
 
 # async def _text_to_speech_consume_chunk(queue: asyncio.Queue, call_id: str, turn_id: str):
 #     while True:
@@ -96,47 +125,87 @@ async def text_to_speech_consumer(queue: asyncio.Queue, transcript_stream: Async
     turn_id = "456"
     print("text to speech consumer started")
     async def extract_text():
+        print("text to speech consumer extract text started")
         async for transcript in transcript_stream:
+
+            print("text to speech consumer got transcript")
             if isinstance(transcript, FullTranscript):
                 yield transcript.text
             # Use .text or whatever attribute holds the string on your Transcript model
             
     try:
-        while True:
-            print("text to speech consumer waiting for transcript")
-            async for audio_chunk in tts_provider.synthesize_audio(extract_text(), call_id, turn_id):
-                print("synthesizing audio chunk")
-                print(len(audio_chunk))
-                queue.put_nowait(audio_chunk)
-        queue.task_done()
+        async for audio_chunk in tts_provider.synthesize_audio(extract_text(), call_id, turn_id):
+            print("text to speech consumer got audio chunk")
+            if not audio_chunk:
+                continue
+            
+            # ─── DEBUG PRINTS START ───
+            print("--- AUDIO CHUNK RECEIVED ---")
+            print(f"Byte Length: {len(audio_chunk)}")
+            # Print the first 20 bytes as a string to check for WAV/RIFF headers
+            print(f"First 20 bytes (Text): {audio_chunk[:20]}")
+            # Print hex format to check structure
+            print(f"First 10 bytes (Hex): {audio_chunk[:10].hex()}")
+            # ─── DEBUG PRINTS END ───
+            
+            queue.put_nowait(audio_chunk)
+        # queue.task_done()
     except asyncio.CancelledError:
+        print("text to speech consumer cancelled")
         return
     except Exception as e:
         print(e)
+        print("text to speech consumer exception")
         return
 
 async def speech_streamer(speaker_queue: std_queue.Queue):
 
+    audio_buffer = io.BytesIO()
+
     def callback(outdata, frames, time, status):
-        try:
-            # 1. Safely pull from the standard thread-safe queue
-            chunk = speaker_queue.get_nowait()
+        # 16-bit Mono = 2 bytes per frame
+        expected_bytes = frames * 2 
+        
+        # 1. Pull any new incoming audio bytes from the queue and append them to our stream buffer
+        while True:
+            try:
+                chunk = speaker_queue.get_nowait()
+                # Write to the end of our current buffer stream
+                current_pos = audio_buffer.tell()
+                audio_buffer.seek(0, io.SEEK_END)
+                audio_buffer.write(chunk)
+                audio_buffer.seek(current_pos)
+            except std_queue.Empty:
+                break
+
+        # Get a predictable memory view wrapper over outdata
+        outdata_bytes = memoryview(outdata)
+
+        # 2. Read exactly what the speaker needs from the current playback window
+        playback_chunk = audio_buffer.read(expected_bytes)
+        read_len = len(playback_chunk)
+
+        if read_len > 0:
+            outdata_bytes[:read_len] = playback_chunk
             
-            # 2. Write bytes to outdata, safely handling size mismatches
-            length = min(len(chunk), len(outdata))
-            outdata[:length] = chunk[:length]
-            
-            # 3. Pad with silence if the chunk is smaller than the required frame size
-            if length < len(outdata):
-                outdata[length:] = b'\x00' * (len(outdata) - length)
-                
-        except std_queue.Empty:
-            # Play silence if the TTS hasn't provided audio yet
-            outdata[:] = b'\x00' * len(outdata)
+            # Pad with zeroed silence if we ran out of data mid-buffer
+            if read_len < expected_bytes:
+                outdata_bytes[read_len:] = b'\x00' * (expected_bytes - read_len)
+        else:
+            # FIX: Clear the memory block safely via slice assignment
+            outdata_bytes[:] = b'\x00' * expected_bytes
+
+        # 3. Memory Cleanup: Clear out spent bytes from the top of the stream to save RAM
+        if audio_buffer.tell() > 100_000:  # Clean every ~100KB consumed
+            remaining_data = audio_buffer.read()
+            audio_buffer.seek(0)
+            audio_buffer.truncate(0)
+            audio_buffer.write(remaining_data)
+            audio_buffer.seek(0)
 
     speaker_stream = sd.RawOutputStream(
-        samplerate=_SAMPLE_RATE,
-        channels=_CHANNELS,
+        samplerate=24000,
+        channels=1,
         dtype='int16',
         blocksize=0,
         callback=callback,
@@ -146,7 +215,7 @@ async def speech_streamer(speaker_queue: std_queue.Queue):
         while True:
             await asyncio.sleep(1)
     except asyncio.CancelledError:
-        speaker_stream.stop()
+        speaker_stream.stop()        
         speaker_stream.close()
         return
 
@@ -223,7 +292,9 @@ if __name__ == "__main__":
         print("stream task started")
         transcript_stream = mic_consumer(mic_queue)
         print("transcript stream started")
-        text_to_speech_task = asyncio.create_task(text_to_speech_consumer(speaker_queue, transcript_stream))
+        agent_stream = agent_flow(transcript_stream)
+        print("agent stream started")
+        text_to_speech_task = asyncio.create_task(text_to_speech_consumer(speaker_queue, agent_stream))
         print("text to speech task started")
         speech_streamer_task = asyncio.create_task(speech_streamer(speaker_queue))
         try:
@@ -232,6 +303,7 @@ if __name__ == "__main__":
             stream_task.cancel()
             text_to_speech_task.cancel()
             speech_streamer_task.cancel()   
+          
             await asyncio.gather(stream_task, text_to_speech_task, speech_streamer_task, return_exceptions=True)
             loop.stop()
             loop.close()
