@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
+from telemetry.logger import Logger
 from telemetry.instrument import TelemetryInstrument
 from voice.errors import ASRConnectionDropped, ASRProviderError, ASRTimeoutError
 from voice.template import ASRBytes, FullTranscript, PartialTranscript
@@ -146,6 +147,8 @@ class DeepgramASR:
         reader: asyncio.Task[None],
         telemetry: TelemetryInstrument,
     ) -> AsyncIterator[PartialTranscript | FullTranscript]:
+        logger = Logger()
+        logger.info("ASR Session Started", extra={"extra_fields": {"call_id": call_id, "turn_id": turn_id, "model": "deepgram-nova-3", "start_time": time.perf_counter()}})
         query = urlencode(
             {
                 "model": _MODEL,
@@ -210,6 +213,8 @@ class DeepgramASR:
                 f"Deepgram rejected the WebSocket handshake ({exc})",
                 provider=PROVIDER,
             ) from exc
+        finally:
+            logger.info("ASR Session Ended", extra={"extra_fields": {"call_id": call_id, "turn_id": turn_id, "model": "deepgram-nova-3", "end_time": time.perf_counter()}})
 
 
 def _raise_if_reader_failed(reader: asyncio.Task[None]) -> None:

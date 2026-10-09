@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
+from telemetry.logger import Logger
 from telemetry.instrument import TelemetryInstrument
 from voice.errors import TTSConnectionDropped, TTSProviderError, TTSTimeoutError
 
@@ -108,6 +109,8 @@ class DeepgramTTS:
         seen_audio: bool,
         telemetry: TelemetryInstrument,
     ) -> AsyncIterator[bytes]:
+        logger = Logger()
+        logger.info("TTS Session Started", extra={"extra_fields": {"call_id": call_id, "turn_id": turn_id, "model": "deepgram-aura-2", "start_time": time.perf_counter()}})
         query = urlencode(
             {
                 "model": _MODEL,
@@ -130,12 +133,14 @@ class DeepgramTTS:
                                 continue
                             if not seen_audio:
                                 seen_audio = True
+                                # log_event(call_id, "First Audio Frame", turn_id)
                                 await telemetry.mark_event("First Audio Frame")
                                 # TELEMETRY HOOK: mark "first_audio" — first TTS audio frame received
                             yield raw
                             continue
                         kind = _control_type(raw)
                         if kind == "Flushed":
+                            # log_event(call_id, "Flushed", turn_id)
                             await telemetry.mark_event("Flushed")
                             # TELEMETRY HOOK: mark "flushed" — Deepgram finished audio for text sent so far
                             continue
@@ -160,6 +165,8 @@ class DeepgramTTS:
                 f"Deepgram rejected the WebSocket handshake ({exc})",
                 provider=PROVIDER,
             ) from exc
+        finally:
+            logger.info("TTS Session Ended", extra={"extra_fields": {"call_id": call_id, "turn_id": turn_id, "model": "deepgram-aura-2", "end_time": time.perf_counter()}})
 
 
 def _raise_if_reader_failed(reader: asyncio.Task[None]) -> None:

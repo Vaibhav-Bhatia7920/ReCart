@@ -3,6 +3,9 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 
+import os
+import time
+import json
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -83,6 +86,12 @@ async def write_to_database(call_id: str, event: Event, turn_id: str) -> None:
     await queue.put((call_id, event, turn_id, future))
     await future
 
+def log_event(call_id: str, event: str, turn_id: str) -> None:
+    """Log an event to the database."""
+    os.makedirs("logs", exist_ok=True)
+    timestamp = time.perf_counter()
+    with open(f"logs/{call_id}.json", "a") as f:
+        f.write(json.dumps({"event": event, "turn_id": turn_id, "timestamp": timestamp}) + "\n")
 
 async def fetch_call_events(call_id: str, turn_id: str | None = None) -> list[dict[str, Any]]:
     """Return marked events for a call, optionally filtered by turn_id."""
