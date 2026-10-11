@@ -13,3 +13,4 @@ htmlcov/
 HLD.*
 LLD.*
 logs/
+audio_db/

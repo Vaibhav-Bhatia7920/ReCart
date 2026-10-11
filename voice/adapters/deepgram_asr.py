@@ -147,8 +147,9 @@ class DeepgramASR:
         reader: asyncio.Task[None],
         telemetry: TelemetryInstrument,
     ) -> AsyncIterator[PartialTranscript | FullTranscript]:
-        logger = Logger()
-        logger.info("ASR Session Started", extra={"extra_fields": {"call_id": call_id, "turn_id": turn_id, "model": "deepgram-nova-3", "start_time": time.perf_counter()}})
+        call_id = "123"
+        turn_id = "456"
+        logger = Logger(call_id)
         query = urlencode(
             {
                 "model": _MODEL,
@@ -189,6 +190,7 @@ class DeepgramASR:
                             else:
                                 if not seen_partial:
                                     seen_partial = True
+                                    logger.log_event("First ASR Transcript", call_id, turn_id, "nova-3")
                                     await telemetry.mark_event("First Partial Transcript")
                                     # TELEMETRY HOOK: mark "first_partial" — first interim result received
                                 yield transcript
@@ -214,8 +216,10 @@ class DeepgramASR:
                 provider=PROVIDER,
             ) from exc
         finally:
-            logger.info("ASR Session Ended", extra={"extra_fields": {"call_id": call_id, "turn_id": turn_id, "model": "deepgram-nova-3", "end_time": time.perf_counter()}})
-
+            logger.log_event("Last ASR Transcript", call_id, turn_id, "nova-3")
+            print("--------------------------------")
+            print("ASR Session Ended")
+            print("--------------------------------")
 
 def _raise_if_reader_failed(reader: asyncio.Task[None]) -> None:
     if not reader.done():

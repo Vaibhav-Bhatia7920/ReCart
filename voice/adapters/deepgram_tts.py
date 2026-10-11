@@ -109,8 +109,9 @@ class DeepgramTTS:
         seen_audio: bool,
         telemetry: TelemetryInstrument,
     ) -> AsyncIterator[bytes]:
-        logger = Logger()
-        logger.info("TTS Session Started", extra={"extra_fields": {"call_id": call_id, "turn_id": turn_id, "model": "deepgram-aura-2", "start_time": time.perf_counter()}})
+        call_id = "123"
+        turn_id = "456"
+        logger = Logger(call_id)
         query = urlencode(
             {
                 "model": _MODEL,
@@ -133,14 +134,14 @@ class DeepgramTTS:
                                 continue
                             if not seen_audio:
                                 seen_audio = True
-                                # log_event(call_id, "First Audio Frame", turn_id)
+                                logger.log_event("First Audio Frame", call_id, turn_id, "aura-2")
                                 await telemetry.mark_event("First Audio Frame")
                                 # TELEMETRY HOOK: mark "first_audio" — first TTS audio frame received
                             yield raw
                             continue
                         kind = _control_type(raw)
                         if kind == "Flushed":
-                            # log_event(call_id, "Flushed", turn_id)
+                        
                             await telemetry.mark_event("Flushed")
                             # TELEMETRY HOOK: mark "flushed" — Deepgram finished audio for text sent so far
                             continue
@@ -166,8 +167,8 @@ class DeepgramTTS:
                 provider=PROVIDER,
             ) from exc
         finally:
-            logger.info("TTS Session Ended", extra={"extra_fields": {"call_id": call_id, "turn_id": turn_id, "model": "deepgram-aura-2", "end_time": time.perf_counter()}})
-
+            logger.log_event("Last Audio Frame", call_id, turn_id, "aura-2")
+            print('------')
 
 def _raise_if_reader_failed(reader: asyncio.Task[None]) -> None:
     if not reader.done():
