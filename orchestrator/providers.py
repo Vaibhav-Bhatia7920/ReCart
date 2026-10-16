@@ -12,7 +12,6 @@ import subprocess
 import io
 import os
 import numpy as np
-import sounddevice as sd
 import queue as std_queue
 from voice.interfaces import ASRProvider, TTSProvider
 from voice.template import ASRBytes, FullTranscript, PartialTranscript
@@ -33,6 +32,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 async def mic_streamer(queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
+    import sounddevice as sd
+
     print("mic streamer started")
     call_id = "123"
     turn_id = "456"
@@ -183,8 +184,8 @@ async def text_to_speech_consumer(queue: asyncio.Queue, transcript_stream: Async
         return
 
 async def speech_streamer(speaker_queue: std_queue.Queue):
+    import sounddevice as sd
 
- 
     audio_buffer = io.BytesIO()
     call_id = "123"
     turn_id = "456"
