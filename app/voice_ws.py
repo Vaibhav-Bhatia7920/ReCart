@@ -6,6 +6,8 @@ from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from orchestrator.providers import DeepgramOrchestrator, agent_flow
+from telemetry.logger import Logger
 from voice.adapters.deepgram_asr import DeepgramASR
 from voice.adapters.deepgram_tts import DeepgramTTS
 from voice.errors import ASRProviderError, TTSProviderError
@@ -39,16 +41,31 @@ async def _pcm_stream(
         yield ASRBytes(bytes=chunk, timestamp=time.time(), call_id=call_id, turn_id=turn_id)
 
 
-async def _one_text(text: str) -> AsyncIterator[str]:
-    yield text
+async def _forward_transcripts(
+    transcript_stream: AsyncIterator[PartialTranscript | FullTranscript],
+    websocket: WebSocket,
+) -> AsyncIterator[PartialTranscript | FullTranscript]:
+    """Mirror transcripts to the client while keeping the database_orchestrate chain intact."""
+    async for transcript in transcript_stream:
+        if isinstance(transcript, PartialTranscript):
+            await websocket.send_json({"type": "partial", "text": transcript.text})
+        elif isinstance(transcript, FullTranscript):
+            await websocket.send_json({"type": "final", "text": transcript.text})
+        yield transcript
 
 
 @router.websocket("/ws/voice")
 async def voice_socket(websocket: WebSocket, call_id: str = "browser-call", turn_id: str = "1") -> None:
-    """PCM in (16 kHz linear16) → transcripts → TTS PCM out (24 kHz linear16)."""
+    """Realtime voice over WebSocket using the database_orchestrate loop.
+
+    PCM in (16 kHz linear16) → ASR → agent_flow → TTS → PCM out (24 kHz linear16).
+    Same pipeline shape as ``database_orchestrate``, with live WS audio instead of files
+    and WS playback instead of ``tts_local_consumer``.
+    """
     await websocket.accept()
     asr_factory: Callable[[], Any] = getattr(websocket.app.state, "asr_factory", default_asr_factory)
     tts_factory: Callable[[], Any] = getattr(websocket.app.state, "tts_factory", default_tts_factory)
+    run_agent_flow = getattr(websocket.app.state, "agent_flow", agent_flow)
     try:
         asr: Any = asr_factory()
         tts: Any = tts_factory()
@@ -68,6 +85,8 @@ async def voice_socket(websocket: WebSocket, call_id: str = "browser-call", turn
         }
     )
     incoming: asyncio.Queue[bytes | None] = asyncio.Queue()
+    logger = Logger(call_id)
+    orchestrator = DeepgramOrchestrator(asr, tts)
 
     async def receive_client() -> None:
         try:
@@ -94,22 +113,31 @@ async def voice_socket(websocket: WebSocket, call_id: str = "browser-call", turn
         except WebSocketDisconnect:
             await incoming.put(None)
 
-    async def transcribe_and_speak() -> None:
-        finals: list[str] = []
+    async def run_database_style_turn() -> None:
         try:
-            stream = asr.transcribe_audio(_pcm_stream(incoming, call_id, turn_id), call_id, turn_id)
-            async for transcript in stream:
-                if isinstance(transcript, PartialTranscript):
-                    await websocket.send_json({"type": "partial", "text": transcript.text})
-                elif isinstance(transcript, FullTranscript):
-                    finals.append(transcript.text)
-                    await websocket.send_json({"type": "final", "text": transcript.text})
-            spoken = " ".join(part.strip() for part in finals if part.strip())
-            if spoken:
-                await websocket.send_json({"type": "tts_start", "sample_rate": _TTS_RATE, "encoding": "linear16"})
-                async for frame in tts.synthesize_audio(_one_text(spoken), call_id, turn_id):
-                    if frame:
-                        await websocket.send_bytes(frame)
+            speech_to_text_stream = orchestrator.speech_to_text_live(
+                _pcm_stream(incoming, call_id, turn_id),
+                call_id,
+                turn_id,
+                logger,
+            )
+            client_visible = _forward_transcripts(speech_to_text_stream, websocket)
+            agent_stream = run_agent_flow(client_visible, logger)
+            text_to_speech_stream = orchestrator.agent_to_tts_orchestrate(
+                agent_stream, call_id, turn_id, logger
+            )
+
+            sent_tts_start = False
+            async for frame in text_to_speech_stream:
+                if not frame:
+                    continue
+                if not sent_tts_start:
+                    await websocket.send_json(
+                        {"type": "tts_start", "sample_rate": _TTS_RATE, "encoding": "linear16"}
+                    )
+                    sent_tts_start = True
+                await websocket.send_bytes(frame)
+            if sent_tts_start:
                 await websocket.send_json({"type": "tts_done"})
             await websocket.send_json({"type": "closed"})
         except Exception as exc:
@@ -117,7 +145,7 @@ async def voice_socket(websocket: WebSocket, call_id: str = "browser-call", turn
 
     receiver = asyncio.create_task(receive_client())
     try:
-        await transcribe_and_speak()
+        await run_database_style_turn()
     finally:
         if not receiver.done():
             receiver.cancel()

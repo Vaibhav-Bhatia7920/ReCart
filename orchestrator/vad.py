@@ -1,6 +1,7 @@
 import asyncio
 import numpy as np
 import torch
+from orchestrator.helper_functions import _chunk_pcm, get_audio_files
 
 # 1. Initialize Silero VAD using PyTorch Hub
 # This fetches the model and provides utility classes.
@@ -32,11 +33,13 @@ async def audio_stream_generator():
     In production, replace this with your actual audio bytes source 
     (e.g., websocket.recv(), pyaudio stream, or a custom WebRTC track).
     """
+    call_id = "123"
+    turn_id = "456"
     while True:
-        # Silero expects 16-bit PCM Audio chunks matching the WINDOW_SIZE_SAMPLES (512 samples)
-        # Yielding 512 samples of empty/dummy bytes every 32ms
-        dummy_pcm_bytes = b'\x00' * (WINDOW_SIZE_SAMPLES * 2) 
-        yield dummy_pcm_bytes
+        async for audio_chunks in get_audio_files(call_id, turn_id):
+            async for audio_chunk in audio_chunks:
+                yield audio_chunk
+        
         await asyncio.sleep(0.032) 
 
 async def main():
@@ -59,3 +62,7 @@ async def main():
                 
             elif "end" in speech_dict:
                 print(f"🤫 Speech ENDED at {speech_dict['end']:.2f}s -> (Send collected buffer to Deepgram/STT)")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

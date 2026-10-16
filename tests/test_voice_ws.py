@@ -67,11 +67,21 @@ class StubTTS:
         yield spoken.encode("utf-8")
 
 
-def test_voice_websocket_transcribes_then_speaks() -> None:
+async def stub_agent_flow(transcript_stream, logger):
+    """Stand-in for SimpleAgentStatelessV1: reply with a fixed agent line."""
+    del logger
+    async for transcript in transcript_stream:
+        if isinstance(transcript, FullTranscript):
+            transcript.text = "I can help with that."
+            yield transcript
+
+
+def test_voice_websocket_runs_database_orchestrate_style_turn() -> None:
     tts = StubTTS()
     with TestClient(app) as starlette_client:
         starlette_client.app.state.asr_factory = lambda: StubASR()
         starlette_client.app.state.tts_factory = lambda: tts
+        starlette_client.app.state.agent_flow = stub_agent_flow
         with starlette_client.websocket_connect("/ws/voice?call_id=call-ws&turn_id=1") as socket:
             ready = socket.receive_json()
             assert ready["type"] == "ready"
@@ -91,8 +101,7 @@ def test_voice_websocket_transcribes_then_speaks() -> None:
                     break
     kinds = [item["type"] if isinstance(item, dict) else "audio" for item in messages]
     assert kinds == ["partial", "final", "tts_start", "audio", "tts_done", "closed"]
+    assert messages[0] == {"type": "partial", "text": "hello"}
     assert messages[1] == {"type": "final", "text": "hello there"}
-    print(messages[3])
-    print(b"hello there")
-    assert messages[3] == b"hello there"
-    assert tts.spoken == ["hello there"]
+    assert messages[3] == b"I can help with that."
+    assert tts.spoken == ["I can help with that."]

@@ -225,3 +225,4 @@ zstandard==0.25.0
 # setuptools
 sounddevice
 numpy
+torch

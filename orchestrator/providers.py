@@ -5,7 +5,9 @@ import time
 import wave
 from collections.abc import AsyncIterator
 from pathlib import Path
-
+import asyncio
+from pathlib import Path
+from typing import AsyncIterator, Optional
 import subprocess
 import io
 import os
@@ -18,6 +20,7 @@ from app.db import init_engine
 from agent.simple_agent_stateless_v1 import SimpleAgentStatelessV1
 from telemetry.helper_functions import log_event
 from telemetry.logger import Logger
+from orchestrator.helper_functions import _wav_to_pcm16k_mono, _mp3_to_pcm16k_mono, _chunk_pcm
 
 
 _PCM_RATE = 16000
@@ -244,128 +247,133 @@ async def speech_streamer(speaker_queue: std_queue.Queue):
         speaker_stream.close()
         return
 
-def _wav_to_pcm16k_mono(wav_bytes: bytes) -> bytes:
-    """Strip the WAV container and match DeepgramASR's linear16 / 16 kHz / mono socket."""
-    with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
-        channels = wav.getnchannels()
-        width = wav.getsampwidth()
-        rate = wav.getframerate()
-        frames = wav.readframes(wav.getnframes())
-    if width != 2:
-        frames = audioop.lin2lin(frames, width, 2)
-        width = 2
-    if channels == 2:
-        frames = audioop.tomono(frames, width, 0.5, 0.5)
-    elif channels != 1:
-        raise ValueError(f"unsupported channel count: {channels}")
-    if rate != _PCM_RATE:
-        frames, _state = audioop.ratecv(frames, width, 1, rate, _PCM_RATE, None)
-    return frames
 
 
+async def _one_text(text: str) -> AsyncIterator[str]:
+    yield text
 
-def _mp3_to_pcm16k_mono(mp3_bytes: bytes) -> bytes:
-    """Decode MP3 bytes and convert to linear16 / 16 kHz / mono PCM for Deepgram."""
-    cmd = [
-        "ffmpeg",
-        "-nostdin",
-        "-threads",
-        "0",
-        "-i",
-        "pipe:0",  # Read input from stdin
-        "-f",
-        "s16le",  # Output raw signed 16-bit little-endian PCM
-        "-acodec",
-        "pcm_s16le",
-        "-ar",
-        str(_PCM_RATE),  # Resample to 16 kHz
-        "-ac",
-        "1",  # Downmix to mono
-        "pipe:1",  # Write output to stdout
-    ]
-
-    process = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-
-    pcm_bytes, stderr = process.communicate(input=mp3_bytes)
-
-    if process.returncode != 0:
-        raise RuntimeError(f"FFmpeg decoding failed: {stderr.decode(errors='replace')}")
-
-    return pcm_bytes
 
 class DeepgramOrchestrator:
-    def __init__(self, asr_provider: ASRProvider, tts_provider: TTSProvider, path: Path):
+    def __init__(
+        self,
+        asr_provider: ASRProvider,
+        tts_provider: TTSProvider,
+        path: Path | None = None,
+    ):
         self.asr_provider = asr_provider
         self.tts_provider = tts_provider
         self.text_to_speech_queue: asyncio.Queue[str] = asyncio.Queue()
         self.path = path
+        
+        # --- Barge-in state management ---
+        self.stop_event = asyncio.Event()
+        self._current_tts_task: Optional[asyncio.Task] = None
+
+    def interrupt(self):
+        """Call this immediately when Silero VAD detects Speech STARTED."""
+        print("🚨 Interrupting: Barge-in detected!")
+        # 1. Signal any running loops to abort
+        self.stop_event.set()
+
+        if self._current_tts_task and not self._current_tts_task.done():
+            self._current_tts_task.cancel()
+
+       
+        while not self.text_to_speech_queue.empty():
+            try:
+                self.text_to_speech_queue.get_nowait()
+                self.text_to_speech_queue.task_done()
+            except (asyncio.QueueEmpty, ValueError):
+                break
+
+    def reset_interrupt(self):
+        """Call this before starting a new turn."""
+        self.stop_event.clear()
 
     async def get_audio_files(self, call_id: str, turn_id: str) -> AsyncIterator[AsyncIterator[ASRBytes]]:
+        if self.path is None:
+            raise ValueError("DeepgramOrchestrator.path is required for file-based ASR")
         audio_files_path = self.path
         for audio_file in sorted((audio_files_path.iterdir()))[:1]:
-            
             if not audio_file.is_file() or audio_file.suffix.lower() not in [".wav", ".mp3"]:
                 continue
             if audio_file.suffix.lower() == ".mp3":
-                print("speech to text orchestrate got mp3 file")
                 pcm = _mp3_to_pcm16k_mono(audio_file.read_bytes())
             else:   
                 pcm = _wav_to_pcm16k_mono(audio_file.read_bytes())
             yield _chunk_pcm(pcm, call_id=call_id, turn_id=turn_id)
 
     async def speech_to_text_orchestrate(
-        self, call_id: str, turn_id: str,
-        logger: Logger
+        self, call_id: str, turn_id: str, logger: Logger
     ) -> AsyncIterator[PartialTranscript | FullTranscript]:
-        print("speech to text orchestrate started 1")
-      
-        async for audio_chunks in self.get_audio_files(call_id, turn_id):
-            print("speech to text orchestrate got audio chunks")
+        try:
+            async for audio_chunks in self.get_audio_files(call_id, turn_id):
+                async for transcript in self.asr_provider.transcribe_audio(audio_chunks, call_id, turn_id):
+                    # Exit immediately if interrupted
+                    if self.stop_event.is_set():
+                        return
+                    yield transcript
+        except asyncio.CancelledError:
+            return
+
+    async def speech_to_text_live(
+        self,
+        audio_chunks: AsyncIterator[ASRBytes | bytes],
+        call_id: str,
+        turn_id: str,
+        logger: Logger,
+    ) -> AsyncIterator[PartialTranscript | FullTranscript]:
+        """Realtime ASR from a live PCM stream (WebSocket / mic), same yield shape as file STT."""
+        del logger  # parity with speech_to_text_orchestrate signature
+        try:
             async for transcript in self.asr_provider.transcribe_audio(audio_chunks, call_id, turn_id):
-                print("speech to text orchestrate got transcript")
+                if self.stop_event.is_set():
+                    return
                 yield transcript
+        except asyncio.CancelledError:
+            return
 
     async def agent_to_tts_orchestrate(
-        self, transcript_stream: AsyncIterator[PartialTranscript | FullTranscript], 
+        self,
+        transcript_stream: AsyncIterator[PartialTranscript | FullTranscript], 
         call_id: str,
         turn_id: str,
         logger: Logger
     ) -> AsyncIterator[bytes]:
-        
-        async for transcript in transcript_stream:
-            if isinstance(transcript, FullTranscript):
-                await self.text_to_speech_queue.put(transcript.text)
-        text_to_synthesize = await self.text_to_speech_queue.get()
+        del logger
+        try:
+            async for transcript in transcript_stream:
+                if self.stop_event.is_set():
+                    return
+                if isinstance(transcript, FullTranscript):
+                    await self.text_to_speech_queue.put(transcript.text)
+                    break
 
-        async for audio_chunk in self.tts_provider.synthesize_audio(text_to_synthesize, call_id, turn_id):
-            yield audio_chunk
+            if self.stop_event.is_set() or self.text_to_speech_queue.empty():
+                return
 
-    async def text_to_speech_orchestrate(
-        self, text: str, call_id: str, turn_id: str
-    ) -> AsyncIterator[bytes]:
-        await self.text_to_speech_queue.put(text)
+            text_to_synthesize = await self.text_to_speech_queue.get()
 
-        async def tokens() -> AsyncIterator[str]:
-            yield await self.text_to_speech_queue.get()
+            async for audio_chunk in self.tts_provider.synthesize_audio(
+                _one_text(text_to_synthesize), call_id, turn_id
+            ):
+                if self.stop_event.is_set():
+                    return
+                yield audio_chunk
 
-        async for audio_chunk in self.tts_provider.synthesize_audio(tokens(), call_id, turn_id):
-            yield audio_chunk
+        except asyncio.CancelledError:
+           
+            return
+    
+    async def tts_local_consumer(self, audio_stream: AsyncIterator[bytes]):
+      
+        try:
+            async for audio_chunk in audio_stream:
+                print(audio_chunk)
+        except asyncio.CancelledError:
+            return
 
 
-async def _chunk_pcm(pcm: bytes, *, call_id: str, turn_id: str) -> AsyncIterator[ASRBytes]:
-    stamp = time.time()
-    for offset in range(0, len(pcm), _CHUNK_BYTES):
-        yield ASRBytes(
-            bytes=pcm[offset : offset + _CHUNK_BYTES],
-            timestamp=stamp,
-            call_id=call_id,
-            turn_id=turn_id,
-        )
 
 
 async def speaker_orchestrate(call_id: str, turn_id: str, logger: Logger):
@@ -407,12 +415,10 @@ async def database_orchestrate(call_id: str, turn_id: str, path: Path, logger: L
 
     print("text to speech orchestrate started")
     text_to_speech_stream = (orchestrator.agent_to_tts_orchestrate(agent_stream, call_id, turn_id, logger))
-    async for audio_chunk in text_to_speech_stream:
-        print("database orchestrate got audio chunk")
-        print(audio_chunk)
- 
+    final_audio_stream = asyncio.create_task(orchestrator.tts_local_consumer(text_to_speech_stream))
+    orchestrator.current_tts_task = final_audio_stream
     try:
-       
+        await asyncio.gather(final_audio_stream)
         print("database orchestrate finished")
     except Exception as e:
         print(e)
