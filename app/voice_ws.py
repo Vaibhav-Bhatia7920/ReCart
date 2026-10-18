@@ -1,10 +1,12 @@
 import asyncio
 import json
+import sys
 import time
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from orchestrator.providers import DeepgramOrchestrator, agent_flow
 from telemetry.logger import Logger
@@ -17,6 +19,30 @@ router = APIRouter()
 
 _ASR_RATE = 16000
 _TTS_RATE = 24000
+
+
+def _websocket_can_send(websocket: WebSocket) -> bool:
+    return websocket.client_state == WebSocketState.CONNECTED
+
+
+async def _safe_send_json(websocket: WebSocket, payload: dict[str, Any]) -> bool:
+    if not _websocket_can_send(websocket):
+        return False
+    try:
+        await websocket.send_json(payload)
+        return True
+    except (WebSocketDisconnect, RuntimeError):
+        return False
+
+
+async def _safe_send_bytes(websocket: WebSocket, data: bytes) -> bool:
+    if not _websocket_can_send(websocket):
+        return False
+    try:
+        await websocket.send_bytes(data)
+        return True
+    except (WebSocketDisconnect, RuntimeError):
+        return False
 
 
 def default_asr_factory() -> DeepgramASR:
@@ -48,9 +74,11 @@ async def _forward_transcripts(
     """Mirror transcripts to the client while keeping the database_orchestrate chain intact."""
     async for transcript in transcript_stream:
         if isinstance(transcript, PartialTranscript):
-            await websocket.send_json({"type": "partial", "text": transcript.text})
+            if not await _safe_send_json(websocket, {"type": "partial", "text": transcript.text}):
+                return
         elif isinstance(transcript, FullTranscript):
-            await websocket.send_json({"type": "final", "text": transcript.text})
+            if not await _safe_send_json(websocket, {"type": "final", "text": transcript.text}):
+                return
         yield transcript
 
 
@@ -132,16 +160,22 @@ async def voice_socket(websocket: WebSocket, call_id: str = "browser-call", turn
                 if not frame:
                     continue
                 if not sent_tts_start:
-                    await websocket.send_json(
-                        {"type": "tts_start", "sample_rate": _TTS_RATE, "encoding": "linear16"}
-                    )
+                    if not await _safe_send_json(
+                        websocket,
+                        {"type": "tts_start", "sample_rate": _TTS_RATE, "encoding": "linear16"},
+                    ):
+                        return
                     sent_tts_start = True
-                await websocket.send_bytes(frame)
+                if not await _safe_send_bytes(websocket, frame):
+                    return
             if sent_tts_start:
-                await websocket.send_json({"type": "tts_done"})
-            await websocket.send_json({"type": "closed"})
+                await _safe_send_json(websocket, {"type": "tts_done"})
+            await _safe_send_json(websocket, {"type": "closed"})
+        except WebSocketDisconnect:
+            return
         except Exception as exc:
-            await websocket.send_json({"type": "error", "message": str(exc)})
+            print(f"voice_ws turn error: {exc!r}", file=sys.stdout, flush=True)
+            await _safe_send_json(websocket, {"type": "error", "message": str(exc)})
 
     receiver = asyncio.create_task(receive_client())
     try:
