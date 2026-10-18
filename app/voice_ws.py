@@ -115,6 +115,7 @@ async def voice_socket(websocket: WebSocket, call_id: str = "browser-call", turn
     incoming: asyncio.Queue[bytes | None] = asyncio.Queue()
     logger = Logger(call_id)
     orchestrator = DeepgramOrchestrator(asr, tts)
+    session_ended = asyncio.Event()
 
     async def receive_client() -> None:
         try:
@@ -122,6 +123,7 @@ async def voice_socket(websocket: WebSocket, call_id: str = "browser-call", turn
                 message = await websocket.receive()
                 if message["type"] == "websocket.disconnect":
                     await incoming.put(None)
+                    session_ended.set()
                     return
                 data = message.get("bytes")
                 if data is not None:
@@ -134,25 +136,28 @@ async def voice_socket(websocket: WebSocket, call_id: str = "browser-call", turn
                     payload = json.loads(text)
                 except json.JSONDecodeError:
                     await incoming.put(None)
+                    session_ended.set()
                     return
                 if payload.get("type") == "end":
                     await incoming.put(None)
+                    session_ended.set()
                     return
         except WebSocketDisconnect:
             await incoming.put(None)
+            session_ended.set()
 
-    async def run_database_style_turn() -> None:
+    async def run_one_turn(active_turn_id: str) -> None:
         try:
             speech_to_text_stream = orchestrator.speech_to_text_live(
-                _pcm_stream(incoming, call_id, turn_id),
+                _pcm_stream(incoming, call_id, active_turn_id),
                 call_id,
-                turn_id,
+                active_turn_id,
                 logger,
             )
             client_visible = _forward_transcripts(speech_to_text_stream, websocket)
             agent_stream = run_agent_flow(client_visible, logger)
             text_to_speech_stream = orchestrator.agent_to_tts_orchestrate(
-                agent_stream, call_id, turn_id, logger
+                agent_stream, call_id, active_turn_id, logger
             )
 
             sent_tts_start = False
@@ -162,25 +167,50 @@ async def voice_socket(websocket: WebSocket, call_id: str = "browser-call", turn
                 if not sent_tts_start:
                     if not await _safe_send_json(
                         websocket,
-                        {"type": "tts_start", "sample_rate": _TTS_RATE, "encoding": "linear16"},
+                        {
+                            "type": "tts_start",
+                            "sample_rate": _TTS_RATE,
+                            "encoding": "linear16",
+                            "turn_id": active_turn_id,
+                        },
                     ):
                         return
                     sent_tts_start = True
                 if not await _safe_send_bytes(websocket, frame):
                     return
             if sent_tts_start:
-                await _safe_send_json(websocket, {"type": "tts_done"})
-            await _safe_send_json(websocket, {"type": "closed"})
+                await _safe_send_json(
+                    websocket, {"type": "tts_done", "turn_id": active_turn_id}
+                )
         except WebSocketDisconnect:
-            return
+            session_ended.set()
         except Exception as exc:
             print(f"voice_ws turn error: {exc!r}", file=sys.stdout, flush=True)
             await _safe_send_json(websocket, {"type": "error", "message": str(exc)})
+            session_ended.set()
+
+    def _turn_id_for_index(base_turn_id: str, index: int) -> str:
+        if index <= 1:
+            return base_turn_id
+        if base_turn_id.isdigit():
+            return str(int(base_turn_id) + index - 1)
+        return f"{base_turn_id}-{index}"
 
     receiver = asyncio.create_task(receive_client())
     try:
-        await run_database_style_turn()
+        turn_index = 1
+        while _websocket_can_send(websocket) and not session_ended.is_set():
+            active_turn_id = _turn_id_for_index(turn_id, turn_index)
+            await run_one_turn(active_turn_id)
+            if session_ended.is_set():
+                break
+            turn_index += 1
+            if not await _safe_send_json(
+                websocket, {"type": "listening", "turn_id": _turn_id_for_index(turn_id, turn_index)}
+            ):
+                break
     finally:
         if not receiver.done():
             receiver.cancel()
         await asyncio.gather(receiver, return_exceptions=True)
+        await _safe_send_json(websocket, {"type": "closed"})

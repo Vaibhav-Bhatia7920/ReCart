@@ -12,7 +12,8 @@ build/
 htmlcov/
 HLD.*
 LLD.*
-logs/
+logs/*
+!logs/.gitkeep
 audio_db/
 certbot/conf/
 certbot/www/

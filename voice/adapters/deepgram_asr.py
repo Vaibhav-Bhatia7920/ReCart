@@ -177,15 +177,17 @@ class DeepgramASR:
                         print("--------------------------------")
                         print("Raw: ", raw)
                         print("--------------------------------")
-                        for transcript, is_final in _transcripts_from_message(raw, call_id, turn_id):
+                        for transcript, utterance_final in _transcripts_from_message(
+                            raw, call_id, turn_id
+                        ):
                             print("--------------------------------")
                             print("Transcript: ", transcript)
                             print("--------------------------------")
-                            print("Is final: ", is_final)
+                            print("Utterance final: ", utterance_final)
                             print("--------------------------------")
-                            if is_final:
+                            if utterance_final:
                                 await telemetry.mark_event("Final Transcript")
-                                # TELEMETRY HOOK: mark "final" — Deepgram signals is_final=true
+                                # TELEMETRY HOOK: end of user utterance (speech_final)
                                 yield transcript
                             else:
                                 if not seen_partial:
@@ -255,6 +257,7 @@ def _transcripts_from_message(
     call_id: str,
     turn_id: str,
 ) -> list[tuple[PartialTranscript | FullTranscript, bool]]:
+    """Second tuple value is True only when the user finished speaking (speech_final)."""
     message = _object_dict(raw)
     print("--------------------------------")
     print("Message: ", message)
@@ -270,14 +273,16 @@ def _transcripts_from_message(
     if message_type != "Results":
         return []
 
-    # speech_final is the utterance-pause flag. Segment finality is is_final.
+    # is_final: segment will not be revised. speech_final: user paused (end of utterance).
     is_final = message.get("is_final") is True
+    speech_final = message.get("speech_final") is True
+    utterance_final = is_final and speech_final
     text = _alternative_transcript(message.get("channel"))
     if text is None:
         return []
     confidence = _alternative_confidence(message.get("channel"))
     start = _number(message.get("start"))
-    if is_final:
+    if utterance_final:
         end_time = start + _number(message.get("duration"))
         transcript: PartialTranscript | FullTranscript = FullTranscript(
             call_id=call_id,
@@ -294,7 +299,7 @@ def _transcripts_from_message(
             timestamp=start,
             stability=min(1.0, max(0.0, confidence)),
         )
-    return [(transcript, is_final)]
+    return [(transcript, utterance_final)]
 
 
 def _object_dict(raw: str | bytes) -> dict[str, object]:
