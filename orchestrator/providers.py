@@ -1,29 +1,21 @@
 import asyncio
-import audioop
 import io
-import time
-import wave
-from collections.abc import AsyncIterator
+import sys
+import traceback
+from collections.abc import AsyncIterator, Callable, Coroutine
+from dataclasses import dataclass
 from pathlib import Path
-import asyncio
-from pathlib import Path
-from typing import AsyncIterator, Optional
-import subprocess
-import io
-import os
-import numpy as np
+from typing import Any, Optional
 import queue as std_queue
 from voice.interfaces import ASRProvider, TTSProvider
 from voice.template import ASRBytes, FullTranscript, PartialTranscript
-from app.db import init_engine
+# from app.db import init_engine  # Orchestrator CLI path: no Postgres/Redis yet (app container still uses DB).
 from agent.simple_agent_stateless_v1 import SimpleAgentStatelessV1
 from telemetry.helper_functions import log_event
 from telemetry.logger import Logger
 from orchestrator.helper_functions import _wav_to_pcm16k_mono, _mp3_to_pcm16k_mono, _chunk_pcm
 
 
-_PCM_RATE = 16000
-_CHUNK_BYTES = 3200  # 100 ms of 16 kHz 16-bit mono
 _SAMPLE_RATE = 16000
 _BLOCK_SIZE = 1024
 _CHANNELS = 1
@@ -31,17 +23,44 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-async def mic_streamer(queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
+
+class _MicStreamStop:
+    """Sentinel: end live mic PCM stream without cancelling the async generator."""
+
+
+_MIC_STOP = _MicStreamStop()
+
+
+def _log_pipeline_error(step: str, exc: BaseException) -> None:
+    print(f"[speaker_orchestrate] {step} failed: {exc!r}", file=sys.stderr, flush=True)
+    traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+
+
+MicStreamerFn = Callable[
+    [asyncio.Queue, asyncio.AbstractEventLoop, str, str, Logger],
+    Coroutine[Any, Any, None],
+]
+SpeechStreamerFn = Callable[[std_queue.Queue], Coroutine[Any, Any, None]]
+AgentFlowFn = Callable[
+    [AsyncIterator[PartialTranscript | FullTranscript], Logger],
+    AsyncIterator[PartialTranscript | FullTranscript],
+]
+
+
+async def mic_streamer(
+    queue: asyncio.Queue,
+    loop: asyncio.AbstractEventLoop,
+    call_id: str,
+    turn_id: str,
+    logger: Logger,
+):
     import sounddevice as sd
 
-    print("mic streamer started")
-    call_id = "123"
-    turn_id = "456"
     def callback(indata, frames, time, status):
         audio_chunk = indata.copy()
         loop.call_soon_threadsafe(queue.put_nowait, audio_chunk)
 
-    logger.info("Mic Streamer Started", extra={"extra_fields": {"call_id": call_id, "turn_id": turn_id}})
+    logger.log_event("Mic Streamer Started", call_id, turn_id)
     stream = sd.InputStream(
         samplerate=_SAMPLE_RATE,
         blocksize=_BLOCK_SIZE,
@@ -58,43 +77,46 @@ async def mic_streamer(queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
         stream.close()
         return
 
-async def _mic_consume_chunk(queue: asyncio.Queue, call_id: str, turn_id: str):
-    print("mic consumer started")
-    while True:
-        try:
-            chunk = await queue.get()
-            print("mic consumer got chunk")
-            
-        except asyncio.QueueEmpty:
-            print("Queue is empty")
-            print("mic consumer got queue empty")
-            break
-        async for audio_chunk in _chunk_pcm(chunk.tobytes(), call_id=call_id, turn_id=turn_id):
-            print("mic consumer got audio chunk")
-            
-            yield audio_chunk
-        queue.task_done()
-    
-
-async def mic_consumer(queue: asyncio.Queue):
-    asr_provider = ASRProvider()
-    call_id = "123"
-    turn_id = "456"
-    audio_stream = _mic_consume_chunk(queue, call_id=call_id, turn_id=turn_id)
-    print("mic consumer audio stream started")
-    try:  
-        logger.info("Mic Consumer Started", extra={"extra_fields": {"call_id": call_id, "turn_id": turn_id, "model": "silero-vad"}})
-        async for transcript in asr_provider.transcribe_audio(audio_stream, call_id, turn_id):
-            print("mic consumer got transcript")
-            print(transcript)
-            if isinstance(transcript, FullTranscript):
-                yield transcript
-            
-            
-        # queue.task_done()
-
+async def _mic_live_pcm_stream(
+    mic_queue: asyncio.Queue,
+    call_id: str,
+    turn_id: str,
+) -> AsyncIterator[ASRBytes | bytes]:
+    """16 kHz int16 mic blocks → chunked PCM for live ASR (same shape as voice_ws ``_pcm_stream``)."""
+    try:
+        while True:
+            chunk = await mic_queue.get()
+            if isinstance(chunk, _MicStreamStop):
+                mic_queue.task_done()
+                return
+            pcm = chunk.tobytes() if hasattr(chunk, "tobytes") else bytes(chunk)
+            async for audio_chunk in _chunk_pcm(pcm, call_id=call_id, turn_id=turn_id):
+                yield audio_chunk
+            mic_queue.task_done()
     except asyncio.CancelledError:
+        raise
+
+
+async def _signal_mic_stop(mic_queue: asyncio.Queue) -> None:
+    await mic_queue.put(_MIC_STOP)
+
+
+async def _drain_live_stt(
+    speech_to_text_stream: AsyncIterator[PartialTranscript | FullTranscript],
+    *,
+    timeout: float = 3.0,
+) -> None:
+    """Pull until Deepgram closes after mic stop (avoids async-generator aclose while running)."""
+    try:
+        async with asyncio.timeout(timeout):
+            async for _transcript in speech_to_text_stream:
+                del _transcript
+    except TimeoutError:
+        print("[speaker_orchestrate] STT drain timed out", file=sys.stderr, flush=True)
+    except StopAsyncIteration:
         return
+    except Exception as exc:
+        _log_pipeline_error("STT drain", exc)
 
 
 async def agent_flow(transcript_stream: AsyncIterator[PartialTranscript | FullTranscript], logger: Logger):
@@ -102,15 +124,15 @@ async def agent_flow(transcript_stream: AsyncIterator[PartialTranscript | FullTr
     turn_id = "456"
     first_full_transcript = False
     
-    try:
-        agent = SimpleAgentStatelessV1()
-    except Exception as e:
-        print(e)
-        return
+    agent = SimpleAgentStatelessV1()
+    transcript_iter = transcript_stream.__aiter__()
     try:
         print("agent flow started")
-        
-        async for transcript in transcript_stream:
+        while True:
+            try:
+                transcript = await transcript_iter.__anext__()
+            except StopAsyncIteration:
+                return
             print("agent flow got transcript")
             if isinstance(transcript, FullTranscript):
                 if not first_full_transcript:
@@ -121,67 +143,12 @@ async def agent_flow(transcript_stream: AsyncIterator[PartialTranscript | FullTr
                 print("agent flow got response")
                 print(response)
                 yield transcript
+                return
     except asyncio.CancelledError:
-        return
-    except Exception as e:
-        print(e)
-        return
+        raise
     finally:
         logger.log_event("Last Agent Transcript", call_id, turn_id, "nova-3")
-        
 
-# async def _text_to_speech_consume_chunk(queue: asyncio.Queue, call_id: str, turn_id: str):
-#     while True:
-#         try:
-#             text = await mic_consumer(queue)
-#             print("text to speech consumer got text")
-#             print(text)
-#         except asyncio.QueueEmpty:
-#             print("Queue is empty")
-#             break
-       
-#             yield text
-#         queue.task_done()
-
-async def text_to_speech_consumer(queue: asyncio.Queue, transcript_stream: AsyncIterator[PartialTranscript | FullTranscript]):
-    tts_provider = TTSProvider()
-
-    call_id = "123"
-    turn_id = "456"
-    print("text to speech consumer started")
-    async def extract_text():
-        print("text to speech consumer extract text started")
-        async for transcript in transcript_stream:
-
-            print("text to speech consumer got transcript")
-            if isinstance(transcript, FullTranscript):
-                yield transcript.text
-            # Use .text or whatever attribute holds the string on your Transcript model
-            
-    try:
-        async for audio_chunk in tts_provider.synthesize_audio(extract_text(), call_id, turn_id):
-            print("text to speech consumer got audio chunk")
-            if not audio_chunk:
-                continue
-            
-            # ─── DEBUG PRINTS START ───
-            print("--- AUDIO CHUNK RECEIVED ---")
-            print(f"Byte Length: {len(audio_chunk)}")
-            # Print the first 20 bytes as a string to check for WAV/RIFF headers
-            print(f"First 20 bytes (Text): {audio_chunk[:20]}")
-            # Print hex format to check structure
-            print(f"First 10 bytes (Hex): {audio_chunk[:10].hex()}")
-            # ─── DEBUG PRINTS END ───
-            
-            queue.put_nowait(audio_chunk)
-        # queue.task_done()
-    except asyncio.CancelledError:
-        print("text to speech consumer cancelled")
-        return
-    except Exception as e:
-        print(e)
-        print("text to speech consumer exception")
-        return
 
 async def speech_streamer(speaker_queue: std_queue.Queue):
     import sounddevice as sd
@@ -332,7 +299,7 @@ class DeepgramOrchestrator:
                     return
                 yield transcript
         except asyncio.CancelledError:
-            return
+            raise
 
     async def agent_to_tts_orchestrate(
         self,
@@ -363,11 +330,9 @@ class DeepgramOrchestrator:
                 yield audio_chunk
 
         except asyncio.CancelledError:
-           
-            return
-    
+            raise
+
     async def tts_local_consumer(self, audio_stream: AsyncIterator[bytes]):
-      
         try:
             async for audio_chunk in audio_stream:
                 print(audio_chunk)
@@ -375,32 +340,160 @@ class DeepgramOrchestrator:
             return
 
 
+async def _tts_speaker_consumer(
+    audio_stream: AsyncIterator[bytes],
+    speaker_queue: std_queue.Queue,
+) -> None:
+    """Play TTS PCM through ``speech_streamer`` (local stand-in for voice_ws byte sends)."""
+    async for audio_chunk in audio_stream:
+        if not audio_chunk:
+            continue
+        speaker_queue.put_nowait(audio_chunk)
 
 
-async def speaker_orchestrate(call_id: str, turn_id: str, logger: Logger):
-    loop = asyncio.get_event_loop()
-    mic_queue = asyncio.Queue()
-    speaker_queue = std_queue.Queue()
-    orchestrator = DeepgramOrchestrator(ASRProvider(), TTSProvider())
-    with logger.span_event("Speech to Text", call_id, turn_id):
-        speech_to_text_stream = orchestrator.speech_to_text_orchestrate(call_id, turn_id)
-    with logger.span_event("Agent Flow ", call_id, turn_id):
-        agent_stream = agent_flow(speech_to_text_stream)
-    with logger.span_event("Text to Speech", call_id, turn_id):
-        text_to_speech_stream = orchestrator.text_to_speech_orchestrate(call_id, turn_id)
-    with logger.span_event("Speech Streamer Started", call_id, turn_id):
-        speech_streamer_task = asyncio.create_task(speech_streamer(speaker_queue))
+async def _run_stt_agent_tts_pipeline(
+    orchestrator: DeepgramOrchestrator,
+    speech_to_text_stream: AsyncIterator[PartialTranscript | FullTranscript],
+    agent_flow_fn: AgentFlowFn,
+    logger: Logger,
+    call_id: str,
+    turn_id: str,
+    speaker_queue: std_queue.Queue,
+) -> None:
+    agent_stream = agent_flow_fn(speech_to_text_stream, logger)
+    text_to_speech_stream = orchestrator.agent_to_tts_orchestrate(
+        agent_stream, call_id, turn_id, logger
+    )
+    await _tts_speaker_consumer(text_to_speech_stream, speaker_queue)
+
+
+async def _cancel_background_tasks(*tasks: asyncio.Task) -> None:
+    pending = [task for task in tasks if not task.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def _wait_for_speaker_queue_drain(
+    speaker_queue: std_queue.Queue,
+    *,
+    timeout: float = 5.0,
+) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not speaker_queue.empty() and loop.time() < deadline:
+        await asyncio.sleep(0.01)
+
+
+@dataclass(frozen=True)
+class SpeakerOrchestrateDeps:
+    """Injected I/O and pipeline steps (defaults = real mic/speaker + agent)."""
+
+    mic_streamer: MicStreamerFn | None = None
+    speech_streamer: SpeechStreamerFn | None = None
+    agent_flow: AgentFlowFn | None = None
+    asr: Any | None = None
+    tts: Any | None = None
+    max_turns: int | None = None  # None = loop until Ctrl+C; tests set 1
+
+
+async def speaker_orchestrate(
+    call_id: str,
+    turn_id: str,
+    logger: Logger,
+    deps: SpeakerOrchestrateDeps | None = None,
+) -> None:
+    """Local end-to-end turn: mic → ASR → agent → TTS → speakers (mirrors ``database_orchestrate`` / voice_ws)."""
+    options = deps or SpeakerOrchestrateDeps()
+    # if os.getenv("DATABASE_URL"):
+    #     init_engine(os.getenv("DATABASE_URL"))
+
+    mic_streamer_fn = options.mic_streamer or mic_streamer
+    speech_streamer_fn = options.speech_streamer or speech_streamer
+    agent_flow_fn = options.agent_flow or agent_flow
+    asr = options.asr if options.asr is not None else ASRProvider()
+    tts = options.tts if options.tts is not None else TTSProvider()
+
+    loop = asyncio.get_running_loop()
+    mic_queue: asyncio.Queue = asyncio.Queue()
+    speaker_queue: std_queue.Queue = std_queue.Queue()
+    orchestrator = DeepgramOrchestrator(asr, tts)
+
+    mic_task = asyncio.create_task(
+        mic_streamer_fn(mic_queue, loop, call_id, turn_id, logger),
+    )
+    speaker_task = asyncio.create_task(speech_streamer_fn(speaker_queue))
+
+    async def run_turn(active_turn_id: str) -> None:
+        speech_to_text_stream: AsyncIterator[PartialTranscript | FullTranscript] | None = None
+        try:
+            speech_to_text_stream = orchestrator.speech_to_text_live(
+                _mic_live_pcm_stream(mic_queue, call_id, active_turn_id),
+                call_id,
+                active_turn_id,
+                logger,
+            )
+            await _run_stt_agent_tts_pipeline(
+                orchestrator,
+                speech_to_text_stream,
+                agent_flow_fn,
+                logger,
+                call_id,
+                active_turn_id,
+                speaker_queue,
+            )
+        except Exception as exc:
+            _log_pipeline_error(f"turn {active_turn_id}", exc)
+            raise
+        finally:
+            try:
+                await _wait_for_speaker_queue_drain(speaker_queue, timeout=60.0)
+                await asyncio.sleep(0.25)
+            except Exception as exc:
+                _log_pipeline_error("speaker playback drain", exc)
+            orchestrator.stop_event.set()
+            try:
+                await _signal_mic_stop(mic_queue)
+            except Exception as exc:
+                _log_pipeline_error("mic stop", exc)
+            if speech_to_text_stream is not None:
+                await _drain_live_stt(speech_to_text_stream, timeout=2.0)
+
+    turn_index = 1
     try:
-        await asyncio.gather(speech_to_text_stream, text_to_speech_stream, speech_streamer_task)
+        while True:
+            orchestrator.reset_interrupt()
+            active_turn_id = turn_id if turn_index == 1 else f"{turn_id}-{turn_index}"
+            print(
+                f"[speaker_orchestrate] turn {turn_index}: listening…",
+                flush=True,
+            )
+            pipeline_task = asyncio.create_task(run_turn(active_turn_id))
+            orchestrator._current_tts_task = pipeline_task
+            await pipeline_task
+            print(
+                f"[speaker_orchestrate] turn {turn_index} complete — speak again (Ctrl+C to quit)",
+                flush=True,
+            )
+            turn_index += 1
+            if options.max_turns is not None and turn_index > options.max_turns:
+                break
     except asyncio.CancelledError:
-        return
+        raise
+    except KeyboardInterrupt:
+        print("[speaker_orchestrate] stopped by user", flush=True)
+    finally:
+        try:
+            await _signal_mic_stop(mic_queue)
+            await _cancel_background_tasks(mic_task, speaker_task)
+            await asyncio.sleep(0.05)
+        except Exception as exc:
+            _log_pipeline_error("speaker_orchestrate shutdown", exc)
 
 async def database_orchestrate(call_id: str, turn_id: str, path: Path, logger: Logger):
-    init_engine(os.getenv("DATABASE_URL"))
-    loop = asyncio.get_event_loop()
-    mic_queue = asyncio.Queue()
+    # init_engine(os.getenv("DATABASE_URL"))
     print("database orchestrate started")
-    speaker_queue = std_queue.Queue()
     orchestrator = DeepgramOrchestrator(ASRProvider(), TTSProvider(), path)
     
     print("speech to text orchestrate started")
@@ -417,15 +510,15 @@ async def database_orchestrate(call_id: str, turn_id: str, path: Path, logger: L
     print("text to speech orchestrate started")
     text_to_speech_stream = (orchestrator.agent_to_tts_orchestrate(agent_stream, call_id, turn_id, logger))
     final_audio_stream = asyncio.create_task(orchestrator.tts_local_consumer(text_to_speech_stream))
-    orchestrator.current_tts_task = final_audio_stream
+    orchestrator._current_tts_task = final_audio_stream
     try:
-        await asyncio.gather(final_audio_stream)
+        await final_audio_stream
         print("database orchestrate finished")
-    except Exception as e:
-        print(e)
-        return
     except asyncio.CancelledError:
-        return
+        raise
+    except Exception as exc:
+        print(f"database_orchestrate failed: {exc!r}", flush=True)
+        raise
 
 
 if __name__ == "__main__":
@@ -433,13 +526,18 @@ if __name__ == "__main__":
         user_input = input("Speaker or Database: ")
         call_id = "123"
         turn_id = "456"
-        logger = Logger(call_id, turn_id)
+        path = Path(__file__).parent.parent / "audio_db" / "audio_files" / "human-nonhuman" / "human"
+        logger = Logger(call_id)
         if user_input == "Speaker":
-            await speaker_orchestrate(call_id, turn_id,logger)
+            await speaker_orchestrate(call_id, turn_id, logger)
         elif user_input == "Database":
             await database_orchestrate(call_id, turn_id, path, logger)
         else:
             print("Invalid input")
             return
         
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as exc:
+        print(f"orchestrator exited with error: {exc!r}", flush=True)
+        raise SystemExit(1) from exc

@@ -19,6 +19,9 @@ router = APIRouter()
 
 _ASR_RATE = 16000
 _TTS_RATE = 24000
+# Browser tabs should capture with getUserMedia echoCancellation and play TTS through the
+# same AudioContext so Chrome/Safari can subtract speaker bleed from the uplink.
+_AEC_MODE = "browser"
 
 
 def _websocket_can_send(websocket: WebSocket) -> bool:
@@ -89,6 +92,12 @@ async def voice_socket(websocket: WebSocket, call_id: str = "browser-call", turn
     PCM in (16 kHz linear16) → ASR → agent_flow → TTS → PCM out (24 kHz linear16).
     Same pipeline shape as ``database_orchestrate``, with live WS audio instead of files
     and WS playback instead of ``tts_local_consumer``.
+
+    Client-side AEC: web clients should enable ``echoCancellation`` (and related constraints)
+    on ``getUserMedia``, play assistant PCM through the same ``AudioContext`` as the mic
+    graph (so the browser has a playback reference), and avoid routing the mic to speakers.
+    Optional JSON ``{"type":"client_hello","aec":{...}}`` after ``ready`` is accepted and ignored
+    by the pipeline (for logging / future tuning).
     """
     await websocket.accept()
     asr_factory: Callable[[], Any] = getattr(websocket.app.state, "asr_factory", default_asr_factory)
@@ -110,6 +119,15 @@ async def voice_socket(websocket: WebSocket, call_id: str = "browser-call", turn
             "encoding": "linear16",
             "call_id": call_id,
             "turn_id": turn_id,
+            "aec": {
+                "mode": _AEC_MODE,
+                "capture_constraints": {
+                    "echoCancellation": True,
+                    "noiseSuppression": True,
+                    "autoGainControl": True,
+                },
+                "playback_same_audio_context": True,
+            },
         }
     )
     incoming: asyncio.Queue[bytes | None] = asyncio.Queue()
@@ -138,7 +156,12 @@ async def voice_socket(websocket: WebSocket, call_id: str = "browser-call", turn
                     await incoming.put(None)
                     session_ended.set()
                     return
-                if payload.get("type") == "end":
+                msg_type = payload.get("type")
+                if msg_type == "client_hello":
+                    if payload.get("aec"):
+                        logger.log_event("Client AEC Hello", call_id, turn_id)
+                    continue
+                if msg_type == "end":
                     await incoming.put(None)
                     session_ended.set()
                     return
@@ -172,6 +195,7 @@ async def voice_socket(websocket: WebSocket, call_id: str = "browser-call", turn
                             "sample_rate": _TTS_RATE,
                             "encoding": "linear16",
                             "turn_id": active_turn_id,
+                            "playback": {"role": "aec_reference"},
                         },
                     ):
                         return

@@ -9,7 +9,7 @@ import json
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from app.db import get_session_factory
+from app.db import database_initialized, get_session_factory
 from telemetry.models import CallEvents
 from voice.template import ASR_Bytes
 
@@ -29,6 +29,10 @@ async def context_manager(input_audio: AsyncIterator[ASR_Bytes]) -> AsyncIterato
 
 async def mark_event_in_db(call_id: str, event: Event, turn_id: str = "") -> None:
     """Append `event` onto the `call_events` row keyed by `call_id`."""
+    if not database_initialized():
+        label = event if isinstance(event, str) else json.dumps(event)
+        log_event(call_id, label, turn_id)
+        return
     await write_to_database(call_id, event, turn_id)
 
 
