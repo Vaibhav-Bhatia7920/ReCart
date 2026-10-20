@@ -124,10 +124,30 @@
       }
     }
 
+    async function ensurePlaybackContext() {
+      if (audioContext && audioContext.state === "closed") {
+        audioContext = null;
+        playbackGain = null;
+      }
+      if (!audioContext) {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({
+          latencyHint: "interactive",
+        });
+        playbackGain = audioContext.createGain();
+        playbackGain.connect(audioContext.destination);
+      }
+      if (audioContext.state === "suspended") {
+        await audioContext.resume();
+      }
+    }
+
     async function startCall() {
       statusText.innerText = "Connecting...";
 
       try {
+        // Unlock output on the user gesture; creating the context only after WS "ready" leaves it suspended.
+        await ensurePlaybackContext();
+
         ws = new WebSocket(BACKEND_WS_URL);
         ws.binaryType = "arraybuffer";
 
@@ -236,12 +256,7 @@
         autoGainControl: true,
       };
 
-      // Native device rate keeps Chrome/Safari AEC effective; resample to 16 kHz for the server.
-      audioContext = new (window.AudioContext || window.webkitAudioContext)({
-        latencyHint: "interactive",
-      });
-      playbackGain = audioContext.createGain();
-      playbackGain.connect(audioContext.destination);
+      await ensurePlaybackContext();
 
       micStream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -276,8 +291,8 @@
     }
 
     async function playIncomingPcm(arrayBuffer) {
-      if (!audioContext) return;
       try {
+        await ensurePlaybackContext();
         const int16 = new Int16Array(arrayBuffer);
         const float32 = new Float32Array(int16.length);
         for (let i = 0; i < int16.length; i++) {
