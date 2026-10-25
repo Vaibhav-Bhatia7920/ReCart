@@ -203,8 +203,12 @@
               }
               ttsPlaybackActive = true;
               nextPlayTime = 0;
-            } else if (msg.type === "tts_done") {
+            } else if (msg.type === "tts_done" || msg.type === "tts_interrupt") {
               ttsPlaybackActive = false;
+              nextPlayTime = 0;
+              if (msg.type === "tts_interrupt") {
+                statusText.innerText = "Listening...";
+              }
             } else if (msg.type === "listening") {
               statusText.innerText = "Listening...";
             } else if (msg.type === "partial" && msg.text) {

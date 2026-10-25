@@ -26,13 +26,14 @@ from store.models import Offer, OfferKind, Product  # noqa: E402
 get_settings.cache_clear()
 
 
-@pytest.fixture(scope="session", autouse=True)
-def apply_migrations() -> None:
+@pytest.fixture(scope="session")
+def _db_schema() -> None:
+    """Alembic upgrade for API/store tests that use the ``client`` fixture (not voice-only WS tests)."""
     command.upgrade(Config("alembic.ini"), "head")
 
 
 @pytest.fixture
-async def client() -> AsyncIterator[AsyncClient]:
+async def client(_db_schema: None) -> AsyncIterator[AsyncClient]:
     async with lifespan(app):
         await _reset_store()
         async with AsyncClient(
