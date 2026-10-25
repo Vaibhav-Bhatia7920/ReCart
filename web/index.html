@@ -279,7 +279,7 @@
       const captureConstraints = serverAec?.capture_constraints || {
         echoCancellation: true,
         noiseSuppression: true,
-        autoGainControl: true,
+        autoGainControl: false,
       };
 
       await ensurePlaybackContext();
