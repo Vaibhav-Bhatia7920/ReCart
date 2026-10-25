@@ -114,6 +114,8 @@
     let uplinkSampleRate = 16000;
     let outputEncoding = "linear16";
     let ttsPlaybackActive = false;
+    let ttsGeneration = 0;
+    const activeTtsSources = new Set();
 
     const callBtn = document.getElementById("callBtn");
     const statusText = document.getElementById("status");
@@ -124,6 +126,25 @@
       } else {
         stopCall();
       }
+    }
+
+    function stopTtsPlayback() {
+      ttsPlaybackActive = false;
+      ttsGeneration += 1;
+      nextPlayTime = 0;
+      for (const source of activeTtsSources) {
+        try {
+          source.stop(0);
+        } catch (_) {
+          /* already stopped */
+        }
+        try {
+          source.disconnect();
+        } catch (_) {
+          /* ignore */
+        }
+      }
+      activeTtsSources.clear();
     }
 
     async function ensurePlaybackContext() {
@@ -165,7 +186,7 @@
                 ? await event.data.arrayBuffer()
                 : null;
           if (binary) {
-            if (ttsPlaybackActive || outputEncoding === "linear16") {
+            if (ttsPlaybackActive) {
               await playIncomingPcm(binary);
             }
             return;
@@ -201,14 +222,13 @@
               if (msg.encoding) {
                 outputEncoding = msg.encoding;
               }
+              stopTtsPlayback();
               ttsPlaybackActive = true;
-              nextPlayTime = 0;
-            } else if (msg.type === "tts_done" || msg.type === "tts_interrupt") {
-              ttsPlaybackActive = false;
-              nextPlayTime = 0;
-              if (msg.type === "tts_interrupt") {
-                statusText.innerText = "Listening...";
-              }
+            } else if (msg.type === "tts_done") {
+              stopTtsPlayback();
+            } else if (msg.type === "tts_interrupt") {
+              stopTtsPlayback();
+              statusText.innerText = "Listening...";
             } else if (msg.type === "listening") {
               statusText.innerText = "Listening...";
             } else if (msg.type === "partial" && msg.text) {
@@ -319,7 +339,14 @@
     // Server sends raw 16-bit PCM chunks (linear16), not MP3/WAV — do not use decodeAudioData().
     async function playIncomingPcm(arrayBuffer) {
       try {
+        if (!ttsPlaybackActive) {
+          return;
+        }
+        const playGeneration = ttsGeneration;
         await ensurePlaybackContext();
+        if (!ttsPlaybackActive || playGeneration !== ttsGeneration) {
+          return;
+        }
         if (arrayBuffer.byteLength < 2) {
           return;
         }
@@ -330,9 +357,14 @@
         }
         const audioBuffer = audioContext.createBuffer(1, float32.length, ttsSampleRate);
         audioBuffer.copyToChannel(float32, 0);
+        if (!ttsPlaybackActive || playGeneration !== ttsGeneration) {
+          return;
+        }
         const source = audioContext.createBufferSource();
         source.buffer = audioBuffer;
         source.connect(playbackGain || audioContext.destination);
+        activeTtsSources.add(source);
+        source.onended = () => activeTtsSources.delete(source);
 
         const now = audioContext.currentTime;
         if (nextPlayTime < now) {
@@ -371,8 +403,7 @@
         ws.close();
         ws = null;
       }
-      nextPlayTime = 0;
-      ttsPlaybackActive = false;
+      stopTtsPlayback();
       outputEncoding = "linear16";
     }
   </script>

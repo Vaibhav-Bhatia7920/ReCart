@@ -143,6 +143,8 @@ async def _stream_tts_frames(
         async for frame in text_to_speech_stream:
             if not frame:
                 continue
+            if not tts_active.is_set() and sent_tts_start:
+                return
             if not sent_tts_start:
                 if not await _safe_send_json(
                     websocket,
@@ -182,6 +184,7 @@ class VoiceSession:
 
 
 async def _handle_barge_in(session: VoiceSession, active_turn_id: str) -> None:
+    session.tts_active.clear()
     session.orchestrator.interrupt()
     session.vad.reset()
     await _safe_send_json(
