@@ -87,6 +87,11 @@ def test_voice_websocket_runs_database_orchestrate_style_turn() -> None:
             assert ready["type"] == "ready"
             assert ready["input_sample_rate"] == 16000
             assert ready["output_sample_rate"] == 24000
+            assert ready["aec"]["mode"] == "browser"
+            assert ready["aec"]["playback_same_audio_context"] is True
+            socket.send_text(
+                '{"type":"client_hello","aec":{"echoCancellation":true}}'
+            )
             socket.send_bytes(bytes(3200))
             socket.send_text('{"type":"end"}')
             messages: list[object] = []

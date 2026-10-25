@@ -112,6 +112,8 @@
     let nextPlayTime = 0;
     let ttsSampleRate = 24000;
     let uplinkSampleRate = 16000;
+    let outputEncoding = "linear16";
+    let ttsPlaybackActive = false;
 
     const callBtn = document.getElementById("callBtn");
     const statusText = document.getElementById("status");
@@ -156,8 +158,16 @@
         };
 
         ws.onmessage = async (event) => {
-          if (event.data instanceof ArrayBuffer) {
-            await playIncomingPcm(event.data);
+          const binary =
+            event.data instanceof ArrayBuffer
+              ? event.data
+              : event.data instanceof Blob
+                ? await event.data.arrayBuffer()
+                : null;
+          if (binary) {
+            if (ttsPlaybackActive || outputEncoding === "linear16") {
+              await playIncomingPcm(binary);
+            }
             return;
           }
           try {
@@ -168,6 +178,9 @@
               }
               if (msg.output_sample_rate) {
                 ttsSampleRate = msg.output_sample_rate;
+              }
+              if (msg.encoding) {
+                outputEncoding = msg.encoding;
               }
               if (!isCalling) {
                 isCalling = true;
@@ -181,8 +194,17 @@
                 );
               }
               statusText.innerText = "Listening...";
-            } else if (msg.type === "tts_start" && msg.sample_rate) {
-              ttsSampleRate = msg.sample_rate;
+            } else if (msg.type === "tts_start") {
+              if (msg.sample_rate) {
+                ttsSampleRate = msg.sample_rate;
+              }
+              if (msg.encoding) {
+                outputEncoding = msg.encoding;
+              }
+              ttsPlaybackActive = true;
+              nextPlayTime = 0;
+            } else if (msg.type === "tts_done") {
+              ttsPlaybackActive = false;
             } else if (msg.type === "listening") {
               statusText.innerText = "Listening...";
             } else if (msg.type === "partial" && msg.text) {
@@ -290,9 +312,13 @@
       silentGain.connect(audioContext.destination);
     }
 
+    // Server sends raw 16-bit PCM chunks (linear16), not MP3/WAV — do not use decodeAudioData().
     async function playIncomingPcm(arrayBuffer) {
       try {
         await ensurePlaybackContext();
+        if (arrayBuffer.byteLength < 2) {
+          return;
+        }
         const int16 = new Int16Array(arrayBuffer);
         const float32 = new Float32Array(int16.length);
         for (let i = 0; i < int16.length; i++) {
@@ -315,6 +341,9 @@
         console.error("Error playing PCM response:", err);
       }
     }
+
+    // Back-compat name used by older deployed builds (those used decodeAudioData and failed on linear16).
+    const playIncomingAudio = playIncomingPcm;
 
     function stopCall() {
       isCalling = false;
@@ -339,6 +368,8 @@
         ws = null;
       }
       nextPlayTime = 0;
+      ttsPlaybackActive = false;
+      outputEncoding = "linear16";
     }
   </script>
 </body>

@@ -17,3 +17,4 @@ logs/*
 audio_db/
 certbot/conf/
 certbot/www/
+audit*
